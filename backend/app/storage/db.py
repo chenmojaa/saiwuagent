@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 from sqlmodel import Field, SQLModel, create_engine, Session, select, text
@@ -80,21 +81,31 @@ class User(SQLModel, table=True):
   updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 _engine = None
+# 懒加载必须加锁：get_engine() 会被线程池线程调用（parallel_plan_node ->
+# hybrid_search -> fts_search）。无锁时多线程可能同时进入初始化分支，
+# 各自 create_engine 并重复跑建表 / 迁移 DDL —— 轻则建出多个 engine，
+# 重则 SQLite 报 table already exists / database is locked。
+# 与 vector.get_collection() 保持同一写法（双重检查锁）。
+_engine_lock = threading.Lock()
 
 
 def get_engine():
   global _engine
   if _engine is None:
-    os.makedirs(os.path.dirname(settings.sqlite_path), exist_ok=True)
-    _engine = create_engine(
-      f"sqlite:///{settings.sqlite_path}",
-      echo=False,
-      connect_args={"check_same_thread": False},
-    )
-    SQLModel.metadata.create_all(_engine)
-    _init_fts(_engine)
-    _migrate_notes(_engine)
-    _migrate_token_version(_engine)
+    with _engine_lock:
+      if _engine is None:   # 等锁期间可能已被其他线程建好
+        os.makedirs(os.path.dirname(settings.sqlite_path), exist_ok=True)
+        engine = create_engine(
+          f"sqlite:///{settings.sqlite_path}",
+          echo=False,
+          connect_args={"check_same_thread": False},
+        )
+        SQLModel.metadata.create_all(engine)
+        _init_fts(engine)
+        _migrate_notes(engine)
+        _migrate_token_version(engine)
+        # 全部初始化成功后才发布，避免别的线程拿到半成品 engine
+        _engine = engine
   return _engine
 
 
@@ -177,7 +188,7 @@ def delete_fts(note_id: str) -> int:
 # FTS5 operator characters we must strip from user input before it can become
 # a MATCH expression. Anything outside this set is treated as ordinary text and
 # gets double-quoted so FTS5 does not interpret it as syntax.
-_FTS5_BAD = set('"()*:^\-+')
+_FTS5_BAD = set('"()*:^-+')
 
 def _fts_sanitize_phrase(raw: str) -> str:
   """Return raw with FTS5 operators replaced by spaces, then collapsed."""

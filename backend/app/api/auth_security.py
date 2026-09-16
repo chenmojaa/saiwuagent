@@ -248,15 +248,45 @@ def export_user_data(user_id: int) -> dict:
     return out
 
 
+class SharedDataDeletionRefused(RuntimeError):
+    """多账号环境下拒绝执行"清空全库"。
+
+    本项目的表结构没有按用户隔离：notes / chat_sessions / chat_messages /
+    memory_facts / mcp_call_log 都没有 user 归属列（只有 user_profiles 和
+    revoked_tokens 带 user_id）。因此"只删我的数据"在这套 schema 下无法
+    表达——单账号时全表 DELETE 恰好等于"清空我这台机器"，语义正确；一旦
+    存在多个账号，它就会连带抹掉别人的知识库。
+    """
+
+
 def delete_user_data(user_id: int) -> int:
     """Wipe all rows tied to this user. Returns the number of rows removed.
 
     Raises on partial failure so the caller can return a 5xx instead of
-    silently lying that the account is gone.
+    silently lying that the account is gone. Raises
+    ``SharedDataDeletionRefused`` when the wipe would destroy other accounts'
+    data (see that class for why the schema makes this unavoidable).
     """
     from app.storage.vector import delete_note_chunks
     removed = 0
     with get_engine().begin() as conn:
+        # ---- 多账号安全闸 ----
+        # 必须在任何 DELETE 之前判断：下面的清空是"全表"语义，多账号下
+        # 会误删他人数据。
+        total_users = conn.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
+        if total_users > 1:
+            _log.error(
+                "delete_user_data refused: %d accounts exist but tables are "
+                "not user-scoped (would wipe every account's notes/sessions)",
+                total_users,
+            )
+            raise SharedDataDeletionRefused(
+                "拒绝执行：数据库中还有 %d 个账号，但 notes / chat_sessions / "
+                "chat_messages 等表未按用户隔离（共享同一份数据）。继续清空会"
+                "连带删除其他账号的知识库。请先删除其他账号（或改为按用户隔离的"
+                "数据模型）后重试。" % total_users
+            )
+
         # Collect note ids before we drop the notes table.
         with Session(get_engine()) as s:
             note_ids = [n.id for n in s.exec(select(Note)).all()]
@@ -265,16 +295,22 @@ def delete_user_data(user_id: int) -> int:
                 delete_note_chunks(nid)
             except Exception as e:
                 _log.warning("vector delete for %s failed: %s", nid, e)
+        # 无 user 归属列的表：单账号下等价于清空本机数据（已在上面拦截多账号）。
         for tbl in (
             "chat_messages",
             "chat_sessions",
             "memory_facts",
-            "user_profiles",
             "mcp_call_log",
-            "revoked_tokens",
         ):
             r = conn.execute(text(f"DELETE FROM {tbl}"))
             removed += r.rowcount or 0
+        # 有 user_id 的表按账号精确删除。
+        r = conn.execute(text("DELETE FROM user_profiles WHERE user_id = :uid"),
+                         {"uid": user_id})
+        removed += r.rowcount or 0
+        r = conn.execute(text("DELETE FROM revoked_tokens WHERE user_id = :uid"),
+                         {"uid": user_id})
+        removed += r.rowcount or 0
         # notes last (after vector) so partial failure is recoverable.
         r = conn.execute(text("DELETE FROM notes"))
         removed += r.rowcount or 0
@@ -290,4 +326,5 @@ __all__ = [
     "reset_rate",
     "export_user_data",
     "delete_user_data",
+    "SharedDataDeletionRefused",
 ]

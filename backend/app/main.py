@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -53,10 +54,77 @@ _ALLOWED_ORIGINS = [
   "https://11gv92qt74799.vicp.fun",
 ]
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+  """应用生命周期钩子，替代已弃用的 on_event(startup) 写法。
+
+  启动阶段：打启动日志 -> 检测 Tesseract/OCR -> 起飞书后台同步循环。
+  关闭阶段：取消飞书后台循环，避免任务悬挂。
+  """
+  logger.info("=" * 50)
+  logger.info("HEAR Agent starting up (v0.6 + LangChain + LangGraph + multi-format)")
+  logger.info(f"LLM:      {settings.llm_provider}/{settings.llm_model}")
+  logger.info(f"Embedding:{settings.embedding_provider}/{settings.embedding_model}")
+  logger.info(f"Storage:  SQLite={settings.sqlite_path}")
+  logger.info(f"Server:   http://{settings.host}:{settings.port}")
+  logger.info("Supported file types: pdf, docx, pptx, xlsx, csv, html, txt/md, images(OCR)")
+  try:
+    from app.tools.ocr import _find_tesseract
+    tess = _find_tesseract()
+    if tess:
+      from pathlib import Path
+      td = Path(tess).parent / "tessdata"
+      langs = sorted([p.stem for p in td.glob("*.traineddata")]) if td.exists() else []
+      logger.info(f"OCR:      tesseract={tess}, langs={langs}")
+      if "chi_sim" not in langs:
+        logger.info("OCR hint: Chinese OCR needs chi_sim.traineddata in tessdata/")
+    else:
+      logger.info("OCR:      tesseract NOT installed (image OCR disabled)")
+  except Exception as e:
+    logger.info(f"OCR check failed: {e}")
+
+  # ---- Feishu background sync ----
+  # The loop always starts and re-checks the runtime config each tick, so a user
+  # who fills in the Feishu settings form after boot gets syncing without a
+  # restart. When not configured/enabled the tick is a cheap no-op.
+  _feishu_task = None
+  if settings.feishu_sync_interval_min > 0:
+    import asyncio
+    from app.feishu_sync import sync_all
+    from app.storage import feishu_config_store as _fcs
+    interval_s = max(60, settings.feishu_sync_interval_min * 60)
+
+    async def _feishu_loop():
+      logger.info(f"Feishu background sync loop started, interval={interval_s}s")
+      while True:
+        try:
+          if _fcs.is_enabled():
+            results = await asyncio.to_thread(sync_all)
+            for r in results:
+              logger.info(
+                f"Feishu sync [{r.space_name}]: synced={r.synced} skipped={r.skipped} failed={r.failed}"
+              )
+        except Exception as e:
+          logger.warning(f"Feishu background sync failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(interval_s)
+
+    _feishu_task = asyncio.create_task(_feishu_loop())
+  else:
+    logger.info("Feishu sync interval=0 (manual sync only)")
+
+  logger.info("=" * 50)
+  try:
+    yield
+  finally:
+    if _feishu_task is not None and not _feishu_task.done():
+      _feishu_task.cancel()
+
+
 app = FastAPI(
   title="HEAR Agent",
   description="Personal knowledge base with multi-LLM + RAG + chat history",
   version="0.6.0",
+  lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -189,56 +257,3 @@ if _FRONTEND_DIST.is_dir():
     return _index_response()
 
   logger.info(f"Frontend static files mounted from {_FRONTEND_DIST}")
-
-
-@app.on_event("startup")
-async def _startup():
-  logger.info("=" * 50)
-  logger.info("HEAR Agent starting up (v0.6 + LangChain + LangGraph + multi-format)")
-  logger.info(f"LLM:      {settings.llm_provider}/{settings.llm_model}")
-  logger.info(f"Embedding:{settings.embedding_provider}/{settings.embedding_model}")
-  logger.info(f"Storage:  SQLite={settings.sqlite_path}")
-  logger.info(f"Server:   http://{settings.host}:{settings.port}")
-  logger.info("Supported file types: pdf, docx, pptx, xlsx, csv, html, txt/md, images(OCR)")
-  try:
-    from app.tools.ocr import _find_tesseract
-    tess = _find_tesseract()
-    if tess:
-      from pathlib import Path
-      td = Path(tess).parent / "tessdata"
-      langs = sorted([p.stem for p in td.glob("*.traineddata")]) if td.exists() else []
-      logger.info(f"OCR:      tesseract={tess}, langs={langs}")
-      if "chi_sim" not in langs:
-        logger.info("OCR hint: Chinese OCR needs chi_sim.traineddata in tessdata/")
-    else:
-      logger.info("OCR:      tesseract NOT installed (image OCR disabled)")
-  except Exception as e:
-    logger.info(f"OCR check failed: {e}")
-
-  # ---- Feishu background sync ----
-  # The loop always starts and re-checks the runtime config each tick, so a user
-  # who fills in the Feishu settings form after boot gets syncing without a
-  # restart. When not configured/enabled the tick is a cheap no-op.
-  if settings.feishu_sync_interval_min > 0:
-    import asyncio
-    from app.feishu_sync import sync_all
-    from app.storage import feishu_config_store as _fcs
-    interval_s = max(60, settings.feishu_sync_interval_min * 60)
-    async def _feishu_loop():
-      logger.info(f"Feishu background sync loop started, interval={interval_s}s")
-      while True:
-        try:
-          if _fcs.is_enabled():
-            results = await asyncio.to_thread(sync_all)
-            for r in results:
-              logger.info(
-                f"Feishu sync [{r.space_name}]: synced={r.synced} skipped={r.skipped} failed={r.failed}"
-              )
-        except Exception as e:
-          logger.warning(f"Feishu background sync failed: {type(e).__name__}: {e}")
-        await asyncio.sleep(interval_s)
-    asyncio.create_task(_feishu_loop())
-  else:
-    logger.info("Feishu sync interval=0 (manual sync only)")
-
-  logger.info("=" * 50)

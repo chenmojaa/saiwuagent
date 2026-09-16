@@ -142,6 +142,18 @@ def _build_initial_state(body: ChatRequest, query: str, session_id: str,
   history = get_messages(session_id, limit=16) if session_id else []
   if not history or history[-1] != {"role": "user", "content": query}:
     history.append({"role": "user", "content": query})
+  # 剥掉历史里的思维链再交给下游。
+  # 存储层保留 <think>（前端要折叠展示），但下游三处都不需要它：
+  #   1) prompt（context.build_messages）
+  #   2) 历史摘要（summarize_overflow）
+  #   3) 长期记忆抽取（extract_facts）
+  # 实测单条消息里思维链能占 46% 的字符，带着它算 token 预算会白白挤掉有效历史。
+  from app.agent.context import strip_think as _strip_think
+  history = [
+    {**m, "content": _strip_think(m.get("content") or "")}
+    for m in history
+  ]
+  history = [m for m in history if (m.get("content") or "").strip()]
 
   # Long-term memory (§6.5): load the cross-session profile for this session's
   # user. Single-user local app -> one shared profile keyed by "default".

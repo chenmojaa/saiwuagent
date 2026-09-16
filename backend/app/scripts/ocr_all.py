@@ -34,6 +34,34 @@ def _should_ocr(text):
     return len(text.strip()) < 30
 
 
+# 只有这些后缀才可能是可 OCR 的图片源。
+# 注意 content_path 指向的是笔记的 .md 正文文件，绝不能拿去当图片喂给 OCR
+# （否则会报 "cannot identify image file ... .md"）。
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
+
+
+def _read_body(note) -> str:
+    """读取笔记的正文文本。
+
+    `notes` 表没有 text / content 列 —— 正文落在 content_path 指向的 .md 文件里
+    （chunk 级文本另存于 chunk_fts）。旧实现直接 `_attr(note, "text")`，永远拿到
+    None，导致 _should_ocr("") 恒为 True，把每条笔记都误判成"需要 OCR"。
+    """
+    for name in ("text", "content", "body"):
+        v = _attr(note, name)
+        if v:
+            return str(v)
+    cp = _attr(note, "content_path")
+    if cp:
+        try:
+            p = Path(cp)
+            if p.is_file():
+                return p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+    return ""
+
+
 def _attr(note, name, default=None):
     """Read SQLModel/dict attribute uniformly."""
     if isinstance(note, dict):
@@ -96,7 +124,7 @@ def main():
     processed = skipped = failed = 0
     for note in notes:
         src = (_attr(note, "source_type") or "").lower()
-        body = _attr(note, "text") or _attr(note, "content") or ""
+        body = _read_body(note)
         nid = _attr(note, "id")
         if src != "image" and not _should_ocr(body):
             skipped += 1
@@ -113,7 +141,9 @@ def main():
         target = None
         for c in candidates:
             try:
-                if c.is_file():
+                # 必须同时满足「存在」+「是图片后缀」：content_path 指向的 .md
+                # 正文文件也 is_file()，但拿它去 OCR 只会报 cannot identify image。
+                if c.is_file() and c.suffix.lower() in _IMAGE_EXTS:
                     target = c
                     break
             except Exception:

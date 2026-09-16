@@ -18,12 +18,34 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Iterable
 
 _log = logging.getLogger(__name__)
 
 _EMPTY_CONTEXT = "(no reference material available)"
 _SEPARATOR = "\n\n---\n\n"
+
+# 推理模型会把思维链写在正文里（<think>...</think> 或 <thinking>）。
+# 存储层必须保留它（前端要折叠展示），但喂给模型时必须剥掉：
+# 思维链对模型理解对话几乎没有价值，实测单条消息里它能占 46% 的字符，
+# 而且会随会话累积——历史窗口被大量无效内容挤占。
+_THINK_RE = re.compile(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", re.IGNORECASE)
+
+
+def strip_think(text: str) -> str:
+    """剥掉正文里的思维链，只留真正的回答。
+
+    未闭合的 <think>（流式截断等）也一并处理：从标记处截断到结尾。
+    """
+    if not text:
+        return text or ""
+    out = _THINK_RE.sub("", text)
+    # 兜底：未闭合的 <think>（模型偶尔不写 </think>），丢弃其后全部内容
+    m = re.search(r"<think(?:ing)?>", out, re.IGNORECASE)
+    if m:
+        out = out[: m.start()]
+    return out.strip()
 
 # ---- Token budgets (§8) ----
 # Rough CJK-aware estimate: 1 CJK char ~ 1.5 tokens, 1 ASCII word ~ 1.3 tokens.
@@ -207,6 +229,15 @@ def build_messages(instructions: str,
   hist = list(history or [])
   if hist and hist[-1].get("role") == "user" and hist[-1].get("content") == question:
     hist = hist[:-1]
+  # 关键：先剥掉思维链，再裁剪窗口。
+  # 顺序不能反——trim_history 按 token 估算裁窗口，若带着 <think> 去算，
+  # 大量预算会被思维链吃掉，真正有用的历史反而被提前挤出去。
+  # 整条只剩思维链（剥完为空）的消息直接丢弃。
+  hist = [
+    {"role": m.get("role"), "content": strip_think(m.get("content") or "")}
+    for m in hist
+  ]
+  hist = [m for m in hist if m["content"]]
   recent, _overflow = trim_history(hist)
   for m in recent:
     if m.get("role") == "user":

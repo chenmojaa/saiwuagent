@@ -25,6 +25,7 @@ import logging
 from typing import Any
 
 from app.agent.state import AgentState
+from app.agent.context import strip_think
 from app.config import settings
 from app.storage.hybrid import hybrid_search
 from app.llm.factory import _build_model
@@ -69,7 +70,22 @@ def _generate_followup(collected: list[dict[str, Any]], original: str,
     try:
         resp = chat.invoke(payload)
         text = getattr(resp, "content", None) or str(resp)
-        return (text or "").strip().splitlines()[0][:200].strip() or None
+        if isinstance(text, list):   # LangChain 的 content 可能是分片列表
+            text = "".join(
+                p.get("text", "") if isinstance(p, dict) else str(p) for p in text
+            )
+        # 必须剥掉思维链：推理模型（MiniMax 等）的响应以 <think> 开头，
+        # 直接取第一行会拿到字面量 "<think>" 当作检索词 —— 拿它去搜只会召回
+        # 一堆无关切片，最终被当成"来源"展示给用户（实测真实发生过）。
+        cleaned = strip_think(str(text or ""))
+        if not cleaned:
+            return None
+        q = cleaned.splitlines()[0][:200].strip()
+        # 兜底：检索词至少要有两个字符且含实义字符，否则视为没生成出角度
+        if len(q) < 2:
+            _log.info("research: follow-up query too short, treating as stalled: %r", q)
+            return None
+        return q
     except Exception as e:
         _log.warning("research: follow-up generation failed: %s", e)
         return None
@@ -202,7 +218,11 @@ def replan_node(state: AgentState) -> dict:
 
 
 def parallel_plan_node(state: AgentState) -> dict:
-  """Run all plan steps concurrently with asyncio.gather (HANDOFF §5).
+  """Run all plan steps concurrently with a ThreadPoolExecutor.
+
+  Note: this node is a *synchronous* LangGraph node, so it cannot use
+  ``asyncio.gather`` — the concurrency comes from a thread pool running the
+  blocking ``hybrid_search`` calls in parallel.
 
   Falls back to the serial execute_plan_node when:
     - parallel_plan_enabled is False
@@ -234,7 +254,7 @@ def parallel_plan_node(state: AgentState) -> dict:
   base_url = state.get("base_url_override")
 
   queries = [str(s.get("query") or "").strip() for s in plan]
-  workers = min(len(queries), max(1, int(getattr(settings, "parallel_plan_max_workers", 4))))
+  workers = min(len(queries), max(1, int(settings.parallel_plan_max_workers)))
 
   def _run_one(args):
     idx, q = args

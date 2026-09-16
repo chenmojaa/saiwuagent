@@ -100,9 +100,10 @@ const sourceTokens = computed(() => sourceLine.value.tokens)
 // range. Either way, dangling [N] buttons render as broken UI.
 //
 // When the LLM did NOT write an explicit "来源：[n]" line but citations
-// exist (backend extracted them from inline [n] markers or from the
-// retrieved chunks), fall back to showing ALL citation indices so the
-// source footer is always visible when references are available.
+// exist (backend extracted them from the inline [n] markers the model did
+// write), fall back to showing ALL citation indices so the source footer is
+// still visible. 注意：后端只会在模型确实写了 [n] 时才返回 citations，
+// 不会再"把检索到的切片当成引用"，所以这里列出的都是真引用。
 const validSourceTokens = computed<number[]>(() => {
   const cites = props.citations
   if (!cites || cites.length === 0) return []
@@ -167,6 +168,36 @@ function extractMermaidTitle(src: string): string {
   return ''
 }
 
+// 已渲染好的 mermaid SVG，按「源码哈希」缓存。
+//
+// 为什么必须放进响应式状态（而不是直接 innerHTML 塞进 DOM）：
+// 模板里 <div class="md-body" v-html="renderedHtml"> 由 v-html 拥有该子树。
+// 原来渲染成功后用 `block.innerHTML = svg` 命令式写入，Vue 完全不知情；
+// 一旦 renderedHtml 重新求值（切页面重进会话后 citations / 流式状态落定等），
+// Vue 就用 innerHTML 覆盖回去 —— SVG 被抹掉、data-rendered 也没了，
+// 于是出现「刚返回时正常，切页/重进变回源码」。
+//
+// 现在把 SVG 纳入 renderedHtml 的求值结果，DOM 与 v-html 始终一致，
+// 任何重渲染都不会再把图冲掉。
+// 值为空串表示「渲染过但失败了」，用于避免反复重试。
+const mermaidSvgs = ref<Record<string, string>>({})
+
+// 把已渲染的 SVG 填回对应块。在 DOMPurify 之后注入，
+// 保证 DOMPurify 不会改动 mermaid 生成的 SVG（其 id/style 等属性较多）。
+// 块的 innerHTML 只有一段转义文本、没有嵌套 div，所以第一个 </div> 就是它的闭合。
+function injectRenderedSvg(html: string, key: string, svg: string): string {
+  const marker = 'data-mmd-key="' + key + '"'
+  const at = html.indexOf(marker)
+  if (at < 0) return html
+  const openEnd = html.indexOf('>', at)
+  if (openEnd < 0) return html
+  const closeAt = html.indexOf('</div>', openEnd)
+  if (closeAt < 0) return html
+  const head = html.slice(0, openEnd).replace(/\s*data-rendered="1"/g, '')
+  const inner = svg || html.slice(openEnd + 1, closeAt)  // 空串=失败，保留源码
+  return head + ' data-rendered="1">' + inner + html.slice(closeAt)
+}
+
 md.use({
   renderer: {
     code(token: Tokens.Code): string {
@@ -175,6 +206,7 @@ md.use({
       if (lang === 'mermaid') {
         const title = extractMermaidTitle(text) || '流程图'
         const source = encodeURIComponent(text)
+        const key = hashContent(text)
         return `<div class="mermaid-card" data-source="${source}">` +
           `<div class="mermaid-card-header">` +
             `<span class="mermaid-card-title">${title}</span>` +
@@ -185,7 +217,7 @@ md.use({
             `</div>` +
           `</div>` +
           `<div class="mermaid-card-body">` +
-            `<div class="mermaid-block" data-source="${source}">${escapeHtml(text)}</div>` +
+            `<div class="mermaid-block" data-source="${source}" data-mmd-key="${key}">${escapeHtml(text)}</div>` +
           `</div>` +
         `</div>`
       }
@@ -198,10 +230,16 @@ md.use({
 const renderedHtml = computed(() => {
   if (props.role !== 'assistant') return ''
   const raw = md.parse(bodyNoCite.value, { async: false }) as string
-  return DOMPurify.sanitize(raw, {
-    ADD_ATTR: ['data-source', 'data-rendered', 'data-action', 'class', 'data-cite', 'title'],
+  let html = DOMPurify.sanitize(raw, {
+    ADD_ATTR: ['data-source', 'data-rendered', 'data-action', 'data-mmd-key', 'class', 'data-cite', 'title'],
     ADD_TAGS: ['span'],
   })
+  // 读 mermaidSvgs 既是为了注入，也让本 computed 依赖它：
+  // 渲染完成写入 SVG 后，这里会自动重算，v-html 与 DOM 保持一致。
+  for (const [key, svg] of Object.entries(mermaidSvgs.value)) {
+    html = injectRenderedSvg(html, key, svg)
+  }
+  return html
 })
 
 // 事件委托：点击内联 [n] 引用按钮时高亮对应来源
@@ -320,6 +358,16 @@ function repairMermaidSource(src: string): string {
   return lines.join('\n').trim()
 }
 
+// 渲染结果写入 mermaidSvgs（响应式），由 renderedHtml 统一注入 DOM。
+// 这里**不再**用 block.innerHTML 直接改 DOM —— 那正是「切页面回来变源码」的根因。
+// 串行化仅作防御性处理（实测 mermaid 11 并发本身没问题，但保证顺序更稳）。
+let mermaidRenderChain: Promise<unknown> = Promise.resolve()
+function serializeMermaidRender<T>(fn: () => Promise<T>): Promise<T> {
+  const run = mermaidRenderChain.then(fn, fn)
+  mermaidRenderChain = run.catch(() => { /* 失败不阻断后续 */ })
+  return run
+}
+
 async function renderMermaidIn(root: HTMLElement): Promise<void> {
   // 流式时序根修：marked 会把未闭合的 ```mermaid 围栏当作完整代码块交给
   // 自定义 renderer，半截源码进 mermaid.render 必然解析失败。围栏数量为
@@ -328,41 +376,46 @@ async function renderMermaidIn(root: HTMLElement): Promise<void> {
   const fenceCount = (bodyNoCite.value.match(/```/g) || []).length
   if (fenceCount % 2 === 1) return
   const blocks = Array.from(root.querySelectorAll<HTMLElement>('.mermaid-block:not([data-rendered])'))
+  const updates: Record<string, string> = {}
   for (const block of blocks) {
+    const key = block.getAttribute('data-mmd-key') || ''
+    if (!key) continue
     const source = decodeURIComponent(block.getAttribute('data-source') || block.textContent || '')
     const renderOnce = async (code: string) => {
       const id = 'mmd-' + Math.random().toString(36).slice(2, 10)
-      const { svg } = await mermaid.render(id, code)
-      return svg
+      const r = await serializeMermaidRender(() => mermaid.render(id, code))
+      return r.svg
     }
-    const paintSvg = (svg: string) => {
-      // 强制 SVG 背景透明，适配暗色主题
-      const svgClean = svg.replace(/<rect[^>]*fill="[^"]*"[^>]*\/>/g, '')
-        .replace(/fill="#fff[^"]*"/g, 'fill="transparent"')
-        .replace(/fill="#ffffff[^"]*"/g, 'fill="transparent"')
-      block.innerHTML = svgClean
-      block.setAttribute('data-rendered', '1')
-    }
+    // 强制 SVG 背景透明，适配暗色主题
+    const cleanSvg = (svg: string) => svg
+      .replace(/<rect[^>]*fill="[^"]*"[^>]*\/>/g, '')
+      .replace(/fill="#fff[^"]*"/g, 'fill="transparent"')
+      .replace(/fill="#ffffff[^"]*"/g, 'fill="transparent"')
     try {
-      paintSvg(await renderOnce(source))
-    } catch {
+      updates[key] = cleanSvg(await renderOnce(source))
+    } catch (err) {
       // 原文解析失败：尝试修复语法后重试一次
+      // 注意：这里一定要打日志。原实现把错误完全吞掉，导致「图变成源码」
+      // 这种问题在浏览器里没有任何线索，只能靠猜。
+      console.warn('[mermaid] 首次渲染失败，尝试修复后重试', err)
       try {
         const repaired = repairMermaidSource(source)
         if (repaired && repaired !== source.trim()) {
-          paintSvg(await renderOnce(repaired))
-          // 修复成功：同步 data-source，让「复制源码」拿到可直接渲染的版本
-          block.setAttribute('data-source', encodeURIComponent(repaired))
+          updates[key] = cleanSvg(await renderOnce(repaired))
           continue
         }
         throw new Error('repair no-op')
-      } catch {
-        // 仍然失败：回退为普通代码块，保证源码可见
-        block.classList.remove('mermaid-block')
-        block.innerHTML = '<pre><code class="language-mermaid">' + escapeHtml(source) + '</code></pre>'
-        block.setAttribute('data-rendered', '1')
+      } catch (err2) {
+        // 仍然失败：保留源码显示。写空串标记「已尝试」，避免每轮反复重试。
+        console.warn('[mermaid] 修复后仍失败，回退为源码显示', err2)
+        console.warn('[mermaid] 原始源码：\n' + source)
+        updates[key] = ''
       }
     }
+  }
+  if (Object.keys(updates).length > 0) {
+    // 一次性写回：触发 renderedHtml 重算 -> v-html 更新 -> 图出现
+    mermaidSvgs.value = { ...mermaidSvgs.value, ...updates }
   }
 }
 
@@ -387,7 +440,7 @@ onMounted(() => {
 watch(renderedHtml, () => {
   refreshMermaid()
   bindMdBodyClick()
-})
+}, { flush: 'post' })
 // Restore + persist thinking open/close. flush:'post' ensures detailsRef is
 // populated (the v-if element exists) by the time we read it.
 watch([think, detailsRef], () => {

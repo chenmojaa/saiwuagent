@@ -51,11 +51,14 @@ PDF（文本型 / 扫描件 OCR）、Word、PPT、Excel、CSV、HTML、TXT / MD�
 **2. 混合检索（中文友好）**
 Chroma 向量（0.7）+ SQLite FTS5 BM25（0.3）双路召回；CJK 两阶段查询（短语匹配 → 单字 OR → LIKE 兜底）；双阈值过滤低质量引用；父块上下文扩展，命中不止是切片。
 
-**3. 多智能体问答（LangGraph 编排）**
-路由器识别意图（聊天 / 研究 / 入库 / 周报）→ 规划器把复杂问题分解为 1-4 个检索子步骤 → 逐步执行 → 材料不足自动补查（最多 3 轮）→ 综合回答。全程 SSE 流式，每一步都看得见。
+**3. 多智能体问答（LangGraph plan-and-execute）**
+路由器识别意图（聊天 / 研究 / 入库 / 周报）→ 规划器把复杂问题分解为 1-4 个检索子步骤 → 逐步执行（可并行）→ 材料不足自动补查（最多 3 轮）→ 综合回答。全程 SSE 流式，计划、每一步执行、引用都实时可见，不是黑盒。
 
-**4. 计划审批（Human-in-the-loop）**
-开启审批模式后，研究任务先生成计划卡片——可查看、编辑、增删步骤，批准后才执行。人机协同，不是黑盒。
+**4. 人机协同：澄清 + 工具审批**
+问题太模糊时，路由器会先抛一张澄清卡片（例："你问的是哪份文档？"），等你补一句再继续，而不是硬猜。工具审批模式下，破坏性工具（写文件、执行命令）调用前会弹窗请求授权，拒绝即中止该次调用。
+
+**4.5 子代理与工具治理**
+内置 explore / plan / general 三个子代理（各自独立的提示词与工具白名单），配合 PreToolUse / PostToolUse 钩子，可在工具调用前后插入自己的脚本做校验、记录或直接否决（返回 `{"block": "reason"}`）。
 
 **5. 带引用的可信回答**
 每个结论带 `[1] [2]` 引用，点回去就是原文切片；无引用时明确用自有知识回答，不编造来源。
@@ -67,9 +70,15 @@ Chroma 向量（0.7）+ SQLite FTS5 BM25（0.3）双路召回；CJK 两阶段查
 wiki 文档 + 多维表格拉进同一知识库；按 `obj_edit_time` 增量更新，改过的页面原位重入库，不打断已有引用。
 
 **8. 长期记忆 + 多模型**
-跨会话事实记忆（自动沉淀用户偏好与上下文）；支持 OpenAI / Anthropic / DeepSeek / 智谱 / Kimi / SiliconFlow / Ollama / MiniMax，每请求可切换模型。
+跨会话事实记忆——每轮对话后台自动抽取用户偏好与上下文（去重后落库），相关时按需召回；历史过长时自动压缩摘要。支持 OpenAI / Anthropic / DeepSeek / 智谱 / Kimi / SiliconFlow / Ollama / MiniMax，每请求可切换模型。
 
-**9. 评测驱动**
+**9. 项目规则（AGENTS.md）**
+自动按 target-first 向上最多 6 层收集 `AGENTS.md` / `.agents.md` / `CLAUDE.md` / `.claude.md`，把项目约定注入系统提示；也可在设置页直接编辑，无需重启。
+
+**10. 权限与安全**
+密码走 PBKDF2 哈希，会话用 HMAC 自签 token（TTL 7 天），前端 DOMPurify 防 XSS，压缩包导入有 zip slip 防护；MCP 破坏性工具默认走弹窗审批。
+
+**11. 评测驱动**
 内置金标准集与跑分脚本（Recall\@K / MRR / 闲聊误引率），调权重、重跑、用数据说话。
 
 ***
@@ -94,15 +103,17 @@ wiki 文档 + 多维表格拉进同一知识库；按 `obj_edit_time` 增量更�
 
 表格最终输出为 Markdown 块，后续切片能保留结构。
 
-### 检索 — 混合 + 智能体
+### 检索 — 混合 + plan-and-execute
 
-- **向量路径**——Chroma 余弦，距离转分数，优先 `mode="query"`，供应商不支持时降级到 `mode="db"`。
+- **向量路径**——Chroma 余弦，距离转分数，优先 `mode="query"`，供应商不支持时降级到 `mode="db"`（按 URL 预判，避免每次重试）。
 
 - **关键词路径**——SQLite FTS5 BM25，友好处理 CJK，两轮查询（短语 + 单词 OR + LIKE 回退）。
 
-- **合并**——按 `(note_id, chunk_index)` 去重，分数 `0.7 * vec + 0.3 * kw`，顶部 K 位加阈值过滤低质量引用。
+- **合并**——按 `(note_id, chunk_index)` 去重，分数 `0.7 * vec + 0.3 * kw`，双阈值（`MIN_FINAL_SCORE` / `MIN_DIM_SCORE`，默认 0.18）过滤低质量引用。
 
-- **多轮研究 agent**——最多 3 轮，后续查询由中型 LLM 生成，赊够的切片集起来后提前结束。
+- **父块上下文扩展**——`merge_neighboring_hits` 聚簇同一笔记内相邻切片（窗口 2），再从 FTS5 回捞 `[center-2, center+2]` 拼成完整上下文，原命中片段另存 `matched_text`。
+
+- **plan-and-execute**——规划器产出 1-4 步检索计划（`HD_PLANNER_MAX_STEPS`），逐步执行；开启并行后多步并发跑（worker 数 = min(步数, 4)，单步失败不拖垮整体）。材料不足时 replan 补查，最多 `HD_RESEARCH_MAX_ITER` 轮（默认 3），反复无新增则自动停（`replan_stalled`）。
 
 - **RAG 评测**——`python scripts/rag_eval/run.py --out report.md` 输出含分类拆解的 Markdown 报告。
 
@@ -134,11 +145,15 @@ wiki 文档 + 多维表格拉进同一知识库；按 `obj_edit_time` 增量更�
 
 - Saiwu 蓝主题（`#3b82f6`）
 
-- SSE 流式响应 + 阶段指示器（intent / research / ingest / report）
+- SSE 流式响应 + 阶段指示器（session / stage / plan / clarify / citations / message / answer / tool / permission / subagent / ingest / report / error / done）
+
+- 计划卡片（可编辑步骤、批准/驳回）、澄清卡片（快速选择或自由补充）
 
 - 引用卡片可点回原文片段
 
 - `IngestResultCard` 渲染结构化入库元信息（标题 / 标签 / 摘要 / 重复提示）
+
+- 设置页支持项目规则（AGENTS.md）、钩子、长期记忆、子代理、权限规则的编辑
 
 ***
 
@@ -147,16 +162,23 @@ wiki 文档 + 多维表格拉进同一知识库；按 `obj_edit_time` 增量更�
 ```mermaid
 flowchart TB
     U[用户输入] --> R[路由器<br/>轻量 LLM<br/>意图 + 重写]
+    R -->|模糊| CL[澄清<br/>抛卡片等待补充]
+    CL --> R
     R -->|聊天| RT[检索]
-    R -->|研究| RS[研究<br/>多轮]
+    R -->|研究| PL[规划器<br/>拆 1-4 步]
+    PL --> EP[执行计划<br/>可并行]
+    EP -->|材料不足| RP[重规划<br/>最多 3 轮]
+    RP --> EP
+    EP --> A[生成答案<br/>LLM 流式]
     R -->|入库| IG[入库<br/>URL / 文本 / 去重]
-    R -->|周报| RP[周报<br/>时间窗口]
-    RT --> A[生成答案<br/>LLM 流式]
-    RS --> A
+    R -->|周报| RP2[周报<br/>时间窗口]
+    RT --> A
     IG --> A
-    RP --> A
+    RP2 --> A
     A --> C[引用切片<br/>跳回原文]
 ```
+
+节点共 7 个：`router` / `planner` / `execute_plan` / `replan` / `retrieve` / `ingest` / `report`。其中 `execute_plan ⟲ replan` 构成 plan-and-execute 循环，每一步都会推一条 SSE 事件，所以前端能看到进展而不是干等。
 
 > 保留老的直调链路：设 `HD_USE_GRAPH=false` 即可。
 
@@ -227,6 +249,22 @@ python dev.py
 2. 等状态从 `embedding` 变为 `N chunks`。
 3. **聊天**页 -> 打开知识库开关，开始问答。
 
+### 复杂问题：计划与澄清
+
+- 问"对比 A 和 B"这类多步问题，路由器会自动升级为研究任务，先生成检索计划（1-4 步），再逐步执行；聊天区会显示一条计划进度条（每个步骤 pending → running → done，补检索步骤用虚线标出），执行过程全程可见。
+- 计划开关在输入框工具栏，可随时关闭（关闭后直接检索，不拆子查询）。
+- 问题太模糊时会弹澄清卡片，选一个或补一句话即可继续。
+
+### 配置项目规则 / 钩子 / 权限
+
+进入**设置**页：
+
+- **项目规则** — 直接编辑 `AGENTS.md`（或 `.agents.md` / `CLAUDE.md` / `.claude.md`）；Agent 运行时按 target-first 向上最多 6 层自动收集，单文件 32KB 上限、最多 8 个来源。
+- **钩子** — 给 `PreToolUse` / `PostToolUse` 挂脚本，从 stdin 收 JSON、往 stdout 写 JSON，返回 `{"block": "reason"}` 可否决某次工具调用（超时默认 5 秒）。
+- **子代理** — 查看 explore / plan / general 三个子代理的提示词与工具白名单。
+- **权限规则** — 定义哪些工具走审批、哪些直接放行。
+- **长期记忆** — 查看/删除自动沉淀的事实条目。
+
 ### 开启飞书同步
 
 ```env
@@ -273,8 +311,13 @@ cd scripts\table_tests
 | `HD_USE_GRAPH`              | `true`                  | LangGraph 驱动 SSE；设 `false` 回退直调                                                             |
 | `HD_ROUTER_ENABLED`         | `true`                  | 关闭则总是走 `chat`                                                                               |
 | `HD_ROUTER_MODEL`           | （空）                     | 可选轻量路由模型                                                                                    |
-| `HD_RESEARCH_MAX_ITER`      | `3`                     | 研究 agent 最多轮数                                                                               |
-| `HD_RESEARCH_TARGET_CHUNKS` | `8`                     | 赊走够多切片后提前结束                                                                                 |
+| `HD_PLANNER_ENABLED`        | `true`                  | 关闭则复杂问题不走规划器                                                                              |
+| `HD_PLANNER_MAX_STEPS`      | `4`                     | 单个计划最多拆几步                                                                                  |
+| `HD_PARALLEL_PLAN_ENABLED`  | `true`                  | 多步计划并发执行                                                                                    |
+| `HD_RESEARCH_MAX_ITER`      | `3`                     | replan 补查最多几轮                                                                             |
+| `HD_RESEARCH_TARGET_CHUNKS` | `8`                     | 攒够多少切片后提前结束                                                                                |
+| `HD_MEMORY_EXTRACTION_ENABLED` | `true`               | 每轮后台抽取长期记忆事实                                                                             |
+| `HD_MEMORY_MAX_FACTS`       | `8`                     | 单次召回事实条数上限                                                                                 |
 | `FEISHU_*`                  | 见 `.env.example`        | 飞书集成                                                                                        |
 | `HD_MAX_UPLOAD_BYTES`       | `52428800`              | 50 MB 上传上限                                                                                  |
 | `HD_ALLOWED_ORIGINS`        | `http://127.0.0.1:5174` | CORS 白名单，多个用逗号分隔                                                                            |
@@ -283,23 +326,18 @@ cd scripts\table_tests
 
 ## 文档
 
-- [docs/FEATURES.md](docs/FEATURES.md) — 完整功能清单
-
-- [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) — v1.1 升级计划 + 验收记录
-
+- [docs/FEATURES.md](docs/FEATURES.md) — 完整功能清单（含全部 API 端点）
 - [docs/RAG.md](docs/RAG.md) — RAG 三层管道深入解析
-
+- [docs/SKILLS.md](docs/SKILLS.md) — 技能（Skill）系统说明
+- [docs/CONTEXT_UPGRADE.md](docs/CONTEXT_UPGRADE.md) — 上下文窗口与预算升级记录
 - [docs/PLAN.md](docs/PLAN.md) — 原始路线图（P0-P9）
-
-- [docs/STATUS.md](docs/STATUS.md) — 历史变更记录
-
 - [docs/file-writing-policy.md](docs/file-writing-policy.md) — UTF-8 no-BOM 约定
 
 ***
 
 ## 路线图
 
-详见 `docs/OPTIMIZATION.md` v1.1 验收表。待完成项：
+详见 `docs/FEATURES.md` 与 `docs/CONTEXT_UPGRADE.md` 的验收记录。待完成项：
 
 - 可选鉴权（`HD_ACCESS_TOKEN` Bearer）供公开部署
 
@@ -308,6 +346,8 @@ cd scripts\table_tests
 - NSSM 自动安装（`scripts/install-service.ps1`，需手动开启）
 
 - 可选 PaddleOCR `PP-StructureV2`，提高扫描表格质量
+
+- 同步版 `hybrid_search` 移出事件循环（避免高并发阻塞）
 
 ***
 

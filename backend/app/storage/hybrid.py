@@ -8,10 +8,16 @@ from sqlmodel import text
 from app.embeddings.factory import embed_texts
 from app.storage.vector import search as vector_search
 from app.storage.db import get_engine
+from app.config import settings
 # dropped before the LLM sees it, so turns like "my name is X" no
 # longer get a fake citation card.
-MIN_FINAL_SCORE = 0.18   # 0.7 * vec + 0.3 * kw
-MIN_DIM_SCORE = 0.18     # max(vec_score, kw_score)
+#
+# 阈值改为可配置（HD_RETRIEVAL_MIN_SCORE / HD_RETRIEVAL_MIN_DIM_SCORE）。
+# 原值 0.18 过于宽松：实测「推荐合肥蜀山区野钓的地点」会召回一批只是词面
+# 沾了"安徽/合肥"的文旅切片（0.24~0.41），随后被模型当成"来源"引用展示。
+# 实测相关查询最低 ≈0.42、不相关最高 ≈0.41，故默认提到 0.45。
+MIN_FINAL_SCORE = float(settings.retrieval_min_score)   # 0.7 * vec + 0.3 * kw
+MIN_DIM_SCORE = float(settings.retrieval_min_dim_score)  # max(vec_score, kw_score)
 from app.storage.db import fts_search
 
 

@@ -35,8 +35,8 @@ def ocr_image(path: str, lang: str = "chi_sim+eng") -> dict:
   """Run OCR on an image file. Returns {"text": str, "engine": str}."""
   import pytesseract
   from PIL import Image
-# Cap pixel dimension before opening to avoid decompression bomb DoS.
-Image.MAX_IMAGE_PIXELS = 16_384 * 16_384
+  # Cap pixel dimension before opening to avoid decompression bomb DoS.
+  Image.MAX_IMAGE_PIXELS = 16_384 * 16_384
 
   tcmd = _find_tesseract()
   if tcmd is None:

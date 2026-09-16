@@ -278,6 +278,10 @@ async def answer_node_stream(state: AgentState, instructions_override=None):
     from langchain_core.messages import ToolMessage
     bound = chat.bind_tools(tools)
     max_steps = max(1, int(getattr(settings, "tools_max_steps", 4) or 4))
+    # 必须在进入循环前初始化：下面 `if not tcs` 分支会读它来判断"是否已经
+    # 执行过工具"。首轮如果模型直接作答（没有 tool_calls）——这是最常见的情
+    # 况——就会读到未定义变量并抛 UnboundLocalError，整条回答流中断。
+    executed_any = False
 
     for _step in range(max_steps):
       agg = _ToolStreamAgg()
@@ -412,20 +416,14 @@ async def answer_node_stream(state: AgentState, instructions_override=None):
       return
 
   citations = _citations_from_text(full_text, chunks)
-  # Fallback: if the LLM did not write any [n] markers in the answer,
-  # expose ALL retrieved chunks as citations so the frontend can still
-  # show the source footer (the user can see where the info came from).
-  if not citations and chunks:
-    citations = [
-      {
-        "note_id": c.get("note_id"),
-        "title": c.get("title"),
-        "chunk_index": c.get("chunk_index"),
-        "snippet": (c.get("text") or "")[:240],
-        "score": c.get("final_score"),
-        "source_type": c.get("source_type", ""),
-        "source_url": c.get("source_url", ""),
-      }
-      for c in chunks
-    ]
+  # 这里**不再**做"模型没写 [n] 就把所有检索切片当引用"的兜底。
+  #
+  # 旧实现的问题：提示词明确要求「参考材料为空或不相关时，改用你自己的知识回答
+  # 且不要提参考材料」。模型据此作答时不会写 [n]，但兜底仍会把全部检索切片塞进
+  # citations，前端 validSourceTokens 又把它们全渲染成「来源：[n]」——
+  # 用户看到"有引用"，会以为答案有知识库依据，而模型其实压根没参考它们。
+  #
+  # 现在语义是：没有 [n] = 模型没有引用任何切片 = 不显示来源。
+  # 这正好也是用户判断"答案是否来自我的资料"的唯一可靠信号。
+  # （「检索到了什么」属于调试信息，不应伪装成引用来源。）
   yield ("done", {"answer": full_text, "citations": citations})

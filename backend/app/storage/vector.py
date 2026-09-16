@@ -2,23 +2,36 @@
 from __future__ import annotations
 
 import os
+import threading
+
 import chromadb
 from app.config import settings
 from app.storage.db import add_fts, delete_fts
 
 _client = None
 _collection = None
+# 懒加载必须加锁：parallel_plan_node 用 ThreadPoolExecutor 并发跑多个
+# hybrid_search，多线程同时首次进入这里会各自 new 一个 PersistentClient，
+# 导致 ChromaDB 报 "Could not connect to tenant default_tenant"（内部
+# 系统缓存被并发建客户端打乱，还会伴随 AttributeError: bindings /
+# KeyError: './data/chroma'）。首次并发访问 100% 触发，静默退化为纯 FTS5。
+# 注意：ChromaDB 的 PersistentClient 本身也不是线程安全的，所以这里
+# 不只保护初始化，读路径也复用同一个已建好的 client/collection。
+_init_lock = threading.Lock()
 
 
 def get_collection():
   global _client, _collection
   if _collection is None:
-    os.makedirs(settings.chroma_dir, exist_ok=True)
-    _client = chromadb.PersistentClient(path=settings.chroma_dir)
-    _collection = _client.get_or_create_collection(
-      name="notes",
-      metadata={"hnsw:space": "cosine"},
-    )
+    with _init_lock:
+      # 双重检查：等锁期间可能已被其他线程初始化好
+      if _collection is None:
+        os.makedirs(settings.chroma_dir, exist_ok=True)
+        _client = chromadb.PersistentClient(path=settings.chroma_dir)
+        _collection = _client.get_or_create_collection(
+          name="notes",
+          metadata={"hnsw:space": "cosine"},
+        )
   return _collection
 
 
