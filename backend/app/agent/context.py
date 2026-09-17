@@ -82,6 +82,10 @@ def format_context(chunks: Iterable[dict] | None,
   for i, c in enumerate(chunk_list):
     text = (c.get("text") or "")[:MAX_CHUNK_CHARS]
     title = c.get("title") or c.get("note_id", "?")
+    # 联网兜底来的材料要显式标注：模型需要知道这段不是用户的知识库内容，
+    # 回答时才能说明来源（否则会当成用户资料来引用）。
+    if (c.get("source_type") or "").strip().lower() == "web":
+      title = "【网络搜索结果】" + str(title)
     # 任务规划：标注该 chunk 由哪个子查询命中，模型可按子问题组织回答
     matched = str(c.get("matched_query") or "").strip()
     if matched:
@@ -99,6 +103,79 @@ def format_context(chunks: Iterable[dict] | None,
   if not rendered:
     return _EMPTY_CONTEXT
   return _SEPARATOR.join(block for _, block in rendered)
+
+
+def format_verify_block(status: str, note: str = "",
+                        conflicts: list | None = None,
+                        stale_note_ids: list | None = None) -> str:
+  """把联网校验结论渲染成注入系统提示的指令块。
+
+  与 answer.py 里 `_forced_notice` 的分工：这里管**软约束**（希望模型怎么写），
+  那里管**硬保证**（无论模型怎么写，用户一定会看到的横幅）。
+  conflict / kb_stale 两条走硬保证，所以这里只给补充指引，不重复贴警告。
+  """
+  st = (status or "").strip().lower()
+  if not st or st in ("disabled", "skipped"):
+    return ""
+
+  note_line = ("\n核对说明：" + note[:200]) if note else ""
+
+  if st == "consistent":
+    return (
+      "[web verification] 本轮已联网核对：知识库与联网结果**一致**。\n"
+      "以知识库材料为主作答；联网结果仅用于印证，不要用它替换知识库的说法。"
+      + note_line
+    )
+
+  if st == "conflict":
+    return (
+      "[web verification] ⚠️ 本轮检测到知识库与联网结果**存在事实性冲突**。\n"
+      "冲突点：\n" + _conflict_lines(conflicts) + "\n"
+      "要求：\n"
+      "1. 已有一条服务端强制插入的冲突提示位于回答最前面，**不要重复它**。\n"
+      "2. 正文中把冲突双方的说法分别陈述，明确标注哪句来自知识库、哪句来自联网。\n"
+      "3. **不要自行裁定谁对谁错**，也不要只讲一方。若无法判断，就直说需要人工复核。"
+      + note_line
+    )
+
+  if st == "kb_stale":
+    stale = "、".join(str(x) for x in (stale_note_ids or [])[:10])
+    return (
+      "[web verification] 知识库中的部分内容已被判定**过期**，相关片段已从参考资料中剔除"
+      + ("（来源：%s）" % stale if stale else "") + "。\n"
+      "要求：不要依据已剔除的内容作答；以联网结果为准，并在回答中说明"
+      "「原有资料已过期，以下为最新信息」。若联网结果不足以回答，就明说资料不足。"
+      + note_line
+    )
+
+  if st == "web_only":
+    return (
+      "[web verification] 本轮知识库**没有**相关材料，参考资料全部来自联网检索。\n"
+      "要求：明确告诉用户「你的知识库中没有相关资料，以下内容来自联网检索」，"
+      "让用户知道这不是基于自己的资料回答的。"
+      + note_line
+    )
+
+  if st == "unverified":
+    return (
+      "[web verification] 本轮**未能完成**联网核对（联网检索失败或核对未完成）。\n"
+      "要求：正常作答，但不要声称内容已经过时效性核对。若回答涉及可能变化的"
+      "数字、政策或时效信息，提醒用户自行确认。"
+      + note_line
+    )
+
+  return ""
+
+
+def _conflict_lines(conflicts: list | None) -> str:
+  out: list[str] = []
+  for i, c in enumerate((conflicts or [])[:5], start=1):
+    if not isinstance(c, dict):
+      continue
+    out.append("- 争议点%d：%s" % (i, str(c.get("claim") or "")[:200]))
+    out.append("    知识库：%s" % str(c.get("kb_says") or "")[:300])
+    out.append("    联网：  %s" % str(c.get("web_says") or "")[:300])
+  return "\n".join(out) if out else "- （裁决未给出具体条目）"
 
 
 def trim_history(messages: list[dict],
@@ -177,7 +254,8 @@ def build_messages(instructions: str,
                    profile: dict | None = None,
                    memory_facts: list[str] | None = None,
                    project_rules: str = "",
-                   inventory: str = "") -> list:
+                   inventory: str = "",
+                   verify_block: str = "") -> list:
   """Assemble the final LangChain message list (§7).
 
   Order is fixed: system (instructions + summary + memory facts + profile +
@@ -221,6 +299,12 @@ def build_messages(instructions: str,
   inv = (inventory or "").strip()
   if inv:
     parts.append(inv)
+
+  # 联网校验指令（策略 A）。放在参考资料之后：模型先看到材料，
+  # 再看到"该怎么用这些材料"的约束，比反过来更符合阅读顺序。
+  vb = (verify_block or "").strip()
+  if vb:
+    parts.append(vb)
 
   msgs = [SystemMessage(content="\n\n".join(parts))]
 

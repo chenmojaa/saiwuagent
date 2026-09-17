@@ -32,7 +32,7 @@ from langchain_core.messages import AIMessage
 from app.llm.factory import _build_model
 from app.agent.state import AgentState
 from app.agent.prompts import get_answer_instructions
-from app.agent.context import build_messages
+from app.agent.context import build_messages, format_verify_block
 from app.agent.tools import load_tools, inventory_text
 from app.config import settings
 
@@ -99,6 +99,12 @@ def _build_messages(state: AgentState):
     memory_facts=state.get("memory_facts") or None,
     project_rules=state.get("project_rules") or "",
     inventory=inventory,
+    verify_block=format_verify_block(
+      state.get("web_verify_status") or "",
+      state.get("web_verify_note") or "",
+      state.get("web_verify_conflicts") or [],
+      state.get("kb_stale_note_ids") or [],
+    ),
   )
   # (inventory now flows through build_messages directly)
   return chat, msgs, chunks, tools, inventory
@@ -229,6 +235,51 @@ class _ToolStreamAgg:
     return self.tool_calls
 
 
+def _forced_notice(state: AgentState) -> str:
+  """冲突 / 知识库过期时，由服务端**强制**插到答案最前面的提示块。
+
+  为什么不能只靠提示词：用户要的是「强制挂冲突警告」。提示词是软约束，
+  模型完全可以不照做（尤其是它自认为已经解释清楚的时候）。服务端拼接是
+  硬保证 —— 哪怕模型完全不配合，用户也一定会看到这条警告。
+
+  只在 conflict / kb_stale 两个 status 下输出：
+    - conflict：两边说法不一致，用户绝不能被蒙在鼓里当成「已确认」。
+    - kb_stale：知识库内容被判定过期并从上下文剔除了，用户必须知道
+      「这次回答没有依据你的旧资料」，否则会误以为知识库仍然生效。
+  unverified / web_only 不加横幅 —— 它们是常态（联网不可用、知识库本来就没有
+  相关材料），每轮都挂横幅会让人对横幅脱敏，反而削弱 conflict 的警示作用。
+  """
+  status = (state.get("web_verify_status") or "").strip().lower()
+  if status == "conflict":
+    lines = [
+      "> ⚠️ **检测到知识库与联网结果存在冲突，以下内容未经裁定，请人工复核。**",
+    ]
+    conflicts = state.get("web_verify_conflicts") or []
+    if conflicts:
+      lines.append(">")
+      for c in conflicts[:5]:
+        if not isinstance(c, dict):
+          continue
+        claim = str(c.get("claim") or "").strip()
+        if claim:
+          lines.append("> - **%s**" % claim)
+        kb_says = str(c.get("kb_says") or "").strip()
+        web_says = str(c.get("web_says") or "").strip()
+        if kb_says:
+          lines.append(">   - 知识库：%s" % kb_says)
+        if web_says:
+          lines.append(">   - 联网：%s" % web_says)
+    return "\n".join(lines) + "\n\n"
+
+  if status == "kb_stale":
+    stale = state.get("kb_stale_note_ids") or []
+    hint = ("（已剔除来源：%s）" % "、".join(str(x) for x in stale[:5])) if stale else ""
+    return (
+      "> ⚠️ **知识库中的相关资料已过期，本次回答未采用旧内容。**%s\n\n" % hint
+    )
+  return ""
+
+
 def answer_node(state: AgentState) -> dict:
   """Non-streaming variant: single structured call. No tool-calling here."""
   chat, msgs, chunks, _tools, _inventory = _build_messages(state)
@@ -238,7 +289,7 @@ def answer_node(state: AgentState) -> dict:
   result = structured.invoke(msgs)
   citations = [c.model_dump() for c in (result.citations or [])] or _citations_from_text(result.text, chunks)
   return {
-    "answer": result.text,
+    "answer": _forced_notice(state) + (result.text or ""),
     "citations": citations,
     "step_count": state.get("step_count", 0) + 1,
   }
@@ -265,6 +316,12 @@ async def answer_node_stream(state: AgentState, instructions_override=None):
     else:
       msgs = [_SM(content=instructions_override)] + list(msgs)
   full_text = ""
+  # 冲突 / 知识库过期时，先把强制警告作为首个 text_delta 推出去。
+  # 单独存一份而不是并进 full_text：下面工具路径用的是 `full_text = agg.text`
+  # （赋值而非累加），并进去会被整个覆盖掉，警告就丢了。
+  notice = _forced_notice(state)
+  if notice:
+    yield ("text_delta", notice)
 
   # 权限模式：default=本地能力调用需用户逐次批准；full=不询问。
   # 同时把模式同步给 mcp_tools（限定 filesystem server 的授权目录）。
@@ -434,4 +491,6 @@ async def answer_node_stream(state: AgentState, instructions_override=None):
   # 现在语义是：没有 [n] = 模型没有引用任何切片 = 不显示来源。
   # 这正好也是用户判断"答案是否来自我的资料"的唯一可靠信号。
   # （「检索到了什么」属于调试信息，不应伪装成引用来源。）
-  yield ("done", {"answer": full_text, "citations": citations})
+  # answer 带上 notice：流式期间它已经单独推给前端了，这里补上是为了让
+  # 落库的对话记录与最终 answer 字段也包含警告 —— 否则历史回看时警告消失。
+  yield ("done", {"answer": notice + full_text, "citations": citations})

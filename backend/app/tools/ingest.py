@@ -129,6 +129,35 @@ def ingest_text(
   )
 
 
+def ingest_web_candidate(
+  title: str | None,
+  content: str,
+  source_url: str,
+  api_key: str | None = None,
+  base_url: str | None = None,
+  embedding_model: str | None = None,
+) -> Note:
+  """把**人工已审核通过**的联网候选写入主知识库。
+
+  这是候选库进入主库的唯一通道（策略 A 的防污染边界）：
+  联网结果先落 pending_candidates，人工 approve 后才调到这里。
+
+  与 ingest_url 的区别：不重新抓网页，直接用审核时看到的那段原文入库。
+  重新抓会引入两个问题 —— ① 内容可能已经变了，人工批的是 A 入库的是 B，
+  审核就失去意义；② 抓取可能失败/被反爬拦截，让「批准」这个动作变得不可靠。
+  """
+  t = (title or source_url or "联网候选")[:200]
+  return _ingest(
+    title=t,
+    content=content,
+    source_type="url",
+    source_url=source_url,
+    api_key=api_key,
+    base_url=base_url,
+    embedding_model=embedding_model,
+  )
+
+
 def ingest_image(
   path: str,
   api_key: str | None = None,

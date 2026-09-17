@@ -433,6 +433,19 @@ async def chat(body: ChatRequest, x_api_key: str | None = Header(None, alias="X-
               rag_hits = len(delta.get("retrieved_chunks") or [])
               yield _sse("stage", {"stage": "rag_search", "status": "started"})
               yield _sse("stage", {"stage": "rag_search", "status": "done", "hits": rag_hits})
+            elif node_name == "verify":
+              # 策略 A：联网核对时效性与事实冲突。耗时和结果都要告诉前端 ——
+              # 校验是「每轮都跑」的，用户有权知道这轮到底核了没有、核出什么。
+              v_status = delta.get("web_verify_status") or ""
+              if v_status:
+                yield _sse("stage", {"stage": "web_verify", "status": "done",
+                                     "verify_status": v_status})
+                yield _sse("verify", {
+                  "status": v_status,
+                  "note": delta.get("web_verify_note") or "",
+                  "conflicts": delta.get("web_verify_conflicts") or [],
+                  "stale_note_ids": delta.get("kb_stale_note_ids") or [],
+                })
             elif node_name == "ingest":
               yield _sse("stage", {"stage": "agent", "status": "done", "agent": "ingest"})
               yield _sse("ingest", delta.get("ingest_result") or {})
@@ -543,8 +556,31 @@ async def chat(body: ChatRequest, x_api_key: str | None = Header(None, alias="X-
         yield _sse("error", {"detail": str(e)})
 
       yield _sse("stage", {"stage": "llm_stream", "status": "done"})
+
       if citations:
         yield _sse("citations", citations)
+
+      # ---- 来源状态：前端据此提示"这次回答有没有用上你的知识库" ----
+      # kb_hits  本轮来自知识库的切片数
+      # web_used 联网兜底的结果是否真的进了上下文（本地无内容时才会走）
+      # grounded 回答是否**真的引用了材料**。注意不等于"检索到了"——
+      #          模型可能判定检索结果不相关，转而用自己的知识作答（此时无引用）。
+      #          前端要区分的是这三种情况，所以以 citations 为准。
+      _chunks = list(final_state.get("retrieved_chunks") or [])
+      _kb = [c for c in _chunks if (c.get("source_type") or "").lower() != "web"]
+      _web = [c for c in _chunks if (c.get("source_type") or "").lower() == "web"]
+      yield _sse("source_status", {
+        "kb_hits": len(_kb),
+        "web_hits": len(_web),
+        "grounded": bool(citations),
+        # 策略 A 的联网校验结果。前端据此显示「已核对 / 未核对 / 有冲突 / 知识库已过期」。
+        # unverified 要显式暴露：用户有权知道这次回答**没能**核对上，
+        # 而不是让它看起来跟核对过一样。
+        "verify_status": final_state.get("web_verify_status") or "",
+        "verify_note": final_state.get("web_verify_note") or "",
+        "conflicts": final_state.get("web_verify_conflicts") or [],
+        "stale_note_ids": final_state.get("kb_stale_note_ids") or [],
+      })
       # ---- Optional sub-agent dispatch (Codex CLI / Claude Code parity) ----
       # If the request set subagent=<mode>, fire a parallel read-only or
       # general-purpose sub-agent run *after* the main answer stream completes

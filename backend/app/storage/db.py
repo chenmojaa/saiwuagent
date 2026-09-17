@@ -69,6 +69,32 @@ class MemoryFact(SQLModel, table=True):
   updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class PendingCandidate(SQLModel, table=True):
+  """待审核候选库（策略 A 的防污染边界）。
+
+  联网结果**永远先落这里**，绝不自动写进主知识库。只有人工 approve 之后，
+  才由 api/candidates.py 走正常 ingest 链路生成 Note + chunk + 向量。
+
+  与 notes 的关系：这里是「候选」，不是知识；approve 成功后用 note_id 回指
+  生成的 Note，便于审计「这条知识是从哪个网页来的、谁批的」。
+  """
+  __tablename__ = "pending_candidates"
+  id: Optional[int] = Field(default=None, primary_key=True)
+  query: str                        # 触发本次联网的问题
+  source_url: str = Field(index=True)
+  title: Optional[str] = None
+  snippet: str                      # 网页原文片段（已截断，见 web_search._MAX_SNIPPET）
+  # 去重键：url + 片段内容的规范化 hash。同一网页在不同轮次被搜到时只留一条，
+  # 否则候选库会被重复条目淹没，人工审核没法用。
+  norm_key: str = Field(index=True)
+  status: str = Field(default="pending", index=True)   # pending | approved | rejected
+  session_id: Optional[str] = None
+  note_id: Optional[str] = None     # approve 后生成的 Note id
+  review_note: Optional[str] = None # 审核备注（驳回理由等）
+  created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+  reviewed_at: Optional[datetime] = None
+
+
 class User(SQLModel, table=True):
   """Login account: phone is the account identifier, password stored as PBKDF2 hash."""
   __tablename__ = "users"

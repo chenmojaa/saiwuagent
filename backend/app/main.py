@@ -25,6 +25,7 @@ from app.api.hooks import router as hooks_router
 from app.api.agents import router as agents_router
 from app.api.background import router as background_router
 from app.api.permissions_rules import router as permissions_rules_router
+from app.api.candidates import router as candidates_router
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -220,6 +221,8 @@ app.include_router(background_router, prefix="/api")
 app.include_router(permissions_rules_router, prefix="/api")
 
 app.include_router(mcp_router, prefix='/api')
+# 待审核候选库（策略 A）：联网结果经人工审批后才进主知识库
+app.include_router(candidates_router, prefix="/api")
 
 # ---- Serve frontend static files (for 花生壳 / production) ----
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"

@@ -33,6 +33,7 @@ from app.agent.nodes.report import report_node
 from app.agent.nodes.research import execute_plan_node, replan_node
 from app.agent.nodes.retrieve import retrieve_node
 from app.agent.nodes.router import route_by_intent, router_node
+from app.agent.nodes.verify import verify_node
 
 
 def route_after_planner(state: AgentState) -> str:
@@ -41,7 +42,13 @@ def route_after_planner(state: AgentState) -> str:
 
 
 def _need_more(state: AgentState) -> bool:
-  """材料不足且 replan 还有预算且没卡住。"""
+  """材料不足且 replan 还有预算且没卡住。
+
+  联网兜底一旦做过就直接收尾：本地已证明没有相关内容，
+  再让模型换角度去搜本地只是空转（联网也不会重复触发）。
+  """
+  if state.get("web_search_used"):
+    return False
   target = max(1, int(settings.research_target_chunks))
   collected = len(state.get("retrieved_chunks") or [])
   replans = len(state.get("research_notes") or [])
@@ -51,7 +58,7 @@ def _need_more(state: AgentState) -> bool:
 
 
 def route_after_step(state: AgentState) -> str:
-  """计划步执行后的去向：继续执行下一步 / 转 replan / 结束。"""
+  """计划步执行后的去向：继续执行下一步 / 转 replan / 转校验。"""
   plan = state.get("plan") or []
   cursor = int(state.get("plan_cursor") or 0)
   target = max(1, int(settings.research_target_chunks))
@@ -60,12 +67,12 @@ def route_after_step(state: AgentState) -> str:
     return "execute_plan"
   if _need_more(state):
     return "replan"
-  return END
+  return "verify"
 
 
 def route_after_replan(state: AgentState) -> str:
-  """replan 一轮后的去向：继续补缺 / 结束。"""
-  return "replan" if _need_more(state) else END
+  """replan 一轮后的去向：继续补缺 / 转校验。"""
+  return "replan" if _need_more(state) else "verify"
 
 
 def _build_workflow() -> StateGraph:
@@ -75,6 +82,7 @@ def _build_workflow() -> StateGraph:
   g.add_node("execute_plan", execute_plan_node)
   g.add_node("replan", replan_node)
   g.add_node("retrieve", retrieve_node)
+  g.add_node("verify", verify_node)
   g.add_node("ingest", ingest_node)
   g.add_node("report", report_node)
 
@@ -91,18 +99,21 @@ def _build_workflow() -> StateGraph:
     "execute_plan": "execute_plan",
     "replan": "replan",
   })
-  # 循环节点：execute_plan -> execute_plan / replan / END
+  # 循环节点：execute_plan -> execute_plan / replan / verify
   g.add_conditional_edges("execute_plan", route_after_step, {
     "execute_plan": "execute_plan",
     "replan": "replan",
-    END: END,
+    "verify": "verify",
   })
-  # replan -> replan / END
+  # replan -> replan / verify
   g.add_conditional_edges("replan", route_after_replan, {
     "replan": "replan",
-    END: END,
+    "verify": "verify",
   })
-  g.add_edge("retrieve", END)
+  # 策略 A：检索完不直接作答，先联网核对时效性与事实冲突。
+  # 两条路径（chat 的 retrieve、research 的循环收尾）都必须经过它。
+  g.add_edge("retrieve", "verify")
+  g.add_edge("verify", END)
   g.add_edge("ingest", END)
   g.add_edge("report", END)
   return g
