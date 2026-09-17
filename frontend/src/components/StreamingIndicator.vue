@@ -52,6 +52,11 @@ const label = computed<string>(() => {
     if (s.agent === 'report')  return '\u5468\u62a5\u751f\u6210\u5b8c\u6210'
     return 'agent \u5b8c\u6210'
   }
+  if (s.stage === 'web_verify') {
+    // 策略 A：知识库命中后仍会联网核对。升级到真实浏览器时可能要 5-12s，
+    // 必须让用户知道在等什么，否则看起来像卡死了。
+    return s.status === 'done' ? '联网核对完成' : '联网核对中...'
+  }
   if (s.stage === 'llm_stream' && s.status === 'started') return '\u751f\u6210\u56de\u7b54\u4e2d...'
   return '\u601d\u8003\u4e2d...'
 })

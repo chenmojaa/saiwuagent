@@ -193,9 +193,19 @@ function injectRenderedSvg(html: string, key: string, svg: string): string {
   if (openEnd < 0) return html
   const closeAt = html.indexOf('</div>', openEnd)
   if (closeAt < 0) return html
-  const head = html.slice(0, openEnd).replace(/\s*data-rendered="1"/g, '')
+  // 只清理**本块**开标签里的 data-rendered。
+  //
+  // 曾经的写法是 html.slice(0, openEnd).replace(...)，作用域覆盖了本块之前的
+  // 全部内容 —— 于是一轮里注入第二个块时，会把第一个块刚打上的
+  // data-rendered="1" 一并抹掉。那个块下一轮又被
+  // `.mermaid-block:not([data-rendered])` 选中重新渲染，写回 mermaidSvgs
+  // 触发 renderedHtml 重算，然后再次被抹掉……**无限循环 = 页面持续闪烁抖动**。
+  // 只有一条 mermaid 时不暴露（head 里没有别的块），所以这个 bug 要同一气泡内
+  // 出现 ≥2 个 mermaid 代码块才会显形。
+  const tagStart = html.lastIndexOf('<', at)
+  const tag = html.slice(tagStart, openEnd).replace(/\s*data-rendered="1"/g, '')
   const inner = svg || html.slice(openEnd + 1, closeAt)  // 空串=失败，保留源码
-  return head + ' data-rendered="1">' + inner + html.slice(closeAt)
+  return html.slice(0, tagStart) + tag + ' data-rendered="1">' + inner + html.slice(closeAt)
 }
 
 md.use({
@@ -413,7 +423,12 @@ async function renderMermaidIn(root: HTMLElement): Promise<void> {
       }
     }
   }
-  if (Object.keys(updates).length > 0) {
+  // 只在内容真的变了时才写回。
+  // mermaidSvgs 是 renderedHtml 的依赖，而 renderedHtml 变化又会触发本函数 ——
+  // 无条件赋值（{...spread} 每次都是新引用）会让这条回路永远停不下来。
+  // 这里加一道闸：值全部相同就不写，从结构上杜绝「渲染 -> 重算 -> 再渲染」死循环。
+  const changed = Object.entries(updates).some(([k, v]) => mermaidSvgs.value[k] !== v)
+  if (changed) {
     // 一次性写回：触发 renderedHtml 重算 -> v-html 更新 -> 图出现
     mermaidSvgs.value = { ...mermaidSvgs.value, ...updates }
   }

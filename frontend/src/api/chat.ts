@@ -38,7 +38,7 @@ export interface ClarifyEvent {
 }
 
 export interface StageEvent {
-  stage: "router" | "rag_search" | "llm_stream" | "agent"
+  stage: "router" | "rag_search" | "llm_stream" | "agent" | "web_verify"
   status: "started" | "done"
   ms?: number
   hits?: number
@@ -110,10 +110,45 @@ export interface PermissionEvent {
   approved?: boolean
 }
 
+/** 来源状态：这次回答有没有用上知识库 / 联网兜底 */
+export interface SourceStatus {
+  /** 本轮来自知识库的切片数 */
+  kb_hits: number
+  /** 联网兜底的结果数（本地完全没有内容时才会 > 0） */
+  web_hits?: number
+  /** 回答是否真的引用了材料（模型判定检索结果不相关时会为 false） */
+  grounded: boolean
+  /** 联网校验结论（策略 A）：consistent | conflict | kb_stale | web_only | unverified | skipped | disabled */
+  verify_status?: string
+  /** 校验的一句话说明 */
+  verify_note?: string
+  /** 冲突条目（verify_status === 'conflict' 时才有） */
+  conflicts?: VerifyConflict[]
+  /** 被判定过期、已从参考资料中剔除的知识库 note_id */
+  stale_note_ids?: string[]
+}
+
+/** 联网校验发现的单条事实冲突 */
+export interface VerifyConflict {
+  claim: string
+  kb_says?: string
+  web_says?: string
+  kb_sources?: { note_id?: string; title?: string }[]
+  web_sources?: { title?: string; url?: string }[]
+}
+
+/** 联网校验事件（在答案开始流式输出之前发出） */
+export interface VerifyEvent {
+  status: string
+  note?: string
+  conflicts?: VerifyConflict[]
+  stale_note_ids?: string[]
+}
+
 export interface ChatStreamEvent {
-  type: "session" | "delta" | "citations" | "done" | "error" | "stage" | "ingest" | "report" | "tool" | "permission" | "plan" | "clarify"
+  type: "session" | "delta" | "citations" | "source_status" | "verify" | "done" | "error" | "stage" | "ingest" | "report" | "tool" | "permission" | "plan" | "clarify"
   session_id?: string
-  data?: string | Citation[] | StageEvent | IngestResult | ReportResult | ToolEvent | PermissionEvent | PlanEvent | ClarifyEvent
+  data?: string | Citation[] | SourceStatus | VerifyEvent | StageEvent | IngestResult | ReportResult | ToolEvent | PermissionEvent | PlanEvent | ClarifyEvent
 }
 
 /** 回复 Agent 的本地访问权限请求（允许 / 拒绝） */
@@ -161,6 +196,12 @@ export async function* chatStream(req: ChatRequest, signal?: AbortSignal): Async
     } else if (ev.event === "citations") {
       try { yield { type: "citations", data: JSON.parse(ev.data) } }
       catch {}
+    } else if (ev.event === "source_status") {
+      try { yield { type: "source_status", data: JSON.parse(ev.data) } }
+      catch {}
+    } else if (ev.event === "verify") {
+      try { yield { type: "verify", data: JSON.parse(ev.data) } }
+      catch {}
     } else if (ev.event === "stage") {
       try { yield { type: "stage", data: JSON.parse(ev.data) } }
       catch {}
@@ -178,8 +219,20 @@ export async function* chatStream(req: ChatRequest, signal?: AbortSignal): Async
       try { yield { type: "ingest", data: JSON.parse(ev.data) } } catch {}
     } else if (ev.event === "report") {
       try { yield { type: "report", data: JSON.parse(ev.data) } } catch {}
-    } else {
+    } else if (ev.event === "message") {
+      // 未具名事件 = 答案正文分片。SSE 规范里这是默认事件类型，
+      // streamSse 也会把「没有 event: 行」的帧标成 "message"。
       yield { type: "delta", data: ev.data }
+    } else {
+      // 未知的**具名**事件：必须忽略，不能当正文。
+      //
+      // 这里原来是个无条件的 else 兜底，把任何未识别事件都当 delta ——
+      // 于是新加的 `verify` 事件（载荷是 JSON）被原样拼进了答案，用户看到的是
+      //   {"status":"conflict",...}这是正常的答案文本
+      // 后端加一个事件类型就会污染所有回答，而且只在触发该事件时出现，
+      // 很容易漏测。按 SSE 语义，具名事件就该由认识它的消费方处理，
+      // 不认识就跳过。
+      console.warn("[sse] 忽略未知事件类型:", ev.event)
     }
   }
 }

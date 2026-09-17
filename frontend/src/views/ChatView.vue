@@ -80,6 +80,37 @@ function formatMsgTime(id: string): string {
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
+// 来源提示：这次回答到底用了什么材料。
+// 之所以要显式提示 —— 检索不到时系统不会报错也不会说"不知道"，
+// 而是直接用模型的通用知识作答，且不产生任何引用。若不给提示，
+// 用户无法区分「这答案来自我的资料」和「来自模型的通用知识」。
+function sourceNotice(m: {
+  sourceStatus?: { kb_hits?: number; web_hits?: number; grounded?: boolean }
+}): { kind: 'web' | 'none'; text: string } | null {
+  const s = m.sourceStatus
+  if (!s) return null
+  if (s.grounded) {
+    // 引用了材料：命中知识库即正常，无需提示
+    if ((s.kb_hits ?? 0) > 0) return null
+    return {
+      kind: 'web',
+      text: t(
+        'chat.source.web',
+        '知识库中未找到相关内容，以下回答基于网络检索',
+        'Nothing relevant in your knowledge base — this answer is based on web search',
+      ),
+    }
+  }
+  return {
+    kind: 'none',
+    text: t(
+      'chat.source.none',
+      '未检索到知识库相关内容，以下回答来自模型通用知识',
+      "No relevant knowledge base content found — this answer comes from the model's general knowledge",
+    ),
+  }
+}
+
 async function loadByRoute() {
   const id = route.params.id as string | undefined
   if (id) {
@@ -247,6 +278,17 @@ function onKey(e: KeyboardEvent) {
           <template v-else-if="chat.streamingHere && m.id === chat.streamingMessageId">
             <ThinkingIndicator :show="true" />
           </template>
+          <!-- 来源提示：未用上知识库时明确告知，避免把模型通用知识误当成自己的资料 -->
+          <div
+            v-if="m.role === 'assistant' && sourceNotice(m)"
+            class="source-notice"
+            :class="sourceNotice(m)!.kind"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+            </svg>
+            <span>{{ sourceNotice(m)!.text }}</span>
+          </div>
           <div v-if="m.role !== 'system'" class="msg-actions">
             <span class="msg-time">{{ formatMsgTime(m.id) }}</span>
             <button class="msg-act" type="button" :title="t('chat.msg.copy', '复制', 'Copy')" :class="{ clicked: clickedAct === 'copy' }" @click="copyMsg(m)">
@@ -675,6 +717,30 @@ function onKey(e: KeyboardEvent) {
 
 .citations-row { margin-top: 6px; }
 .ingest-row { margin-top: 6px; }
+
+/* 来源提示条：提醒这次回答没有用上知识库 */
+.source-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  border: 1px solid transparent;
+}
+.source-notice svg { flex: none; margin-top: 2px; }
+.source-notice.none {
+  color: var(--warn-text, #8a5300);
+  background: var(--warn-bg, rgba(250, 173, 20, 0.1));
+  border-color: var(--warn-border, rgba(250, 173, 20, 0.35));
+}
+.source-notice.web {
+  color: var(--info-text, #0b5a8a);
+  background: var(--info-bg, rgba(24, 144, 255, 0.09));
+  border-color: var(--info-border, rgba(24, 144, 255, 0.32));
+}
 .report-row {
   margin-top: 6px;
   padding: 10px 14px;

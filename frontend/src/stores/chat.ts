@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { chatStream, respondClarify, respondPermission, stripThink, type ChatMessage, type ChatRequest, type Citation, type ClarifyEvent, type IngestResult, type ReportResult, type ToolEvent, type PermissionEvent, type PlanStepItem, type PlanEvent } from '@/api/chat'
+import { chatStream, respondClarify, respondPermission, stripThink, type ChatMessage, type ChatRequest, type Citation, type ClarifyEvent, type IngestResult, type ReportResult, type ToolEvent, type PermissionEvent, type PlanStepItem, type PlanEvent, type SourceStatus, type VerifyEvent } from '@/api/chat'
 import { useSettingsStore } from './settings'
 import { useModelsStore } from './models'
 import { useSessionsStore } from './sessions'
@@ -33,9 +33,15 @@ interface Msg extends ChatMessage {
   // 任务规划：计划摘要 + 步骤执行状态（plan-strip 渲染）
   planSummary?: string
   planSteps?: PlanStepItem[]
+  // 来源状态：这次回答有没有用上知识库 / 联网兜底（用于提示条）
+  sourceStatus?: SourceStatus
+  // 联网校验（策略 A）：答案开始流式输出之前就到达，可据此在答案上方渲染
+  // 冲突卡片。source_status 里也有同一份数据，但那个是流结束才发的，
+  // 想边流边提示就得用这个。
+  verify?: VerifyEvent
 }
 export interface PipelineStage {
-  stage: "router" | "rag_search" | "llm_stream" | "agent"
+  stage: "router" | "rag_search" | "llm_stream" | "agent" | "web_verify"
   status: "started" | "done"
   ms?: number
   hits?: number
@@ -307,6 +313,18 @@ export const useChatStore = defineStore("chat", {
             }
           } else if (ev.type === 'citations' && Array.isArray(ev.data)) {
             asstMsg.citations = ev.data as Citation[]
+            const idx = this.messages.findIndex(m => m.id === asstMsg.id)
+            if (idx >= 0) this.messages[idx] = { ...asstMsg }
+          } else if (ev.type === 'source_status' && ev.data && typeof ev.data === 'object') {
+            // 来源状态：知识库有没有命中 / 是否走了联网兜底 / 回答有没有真的引用
+            asstMsg.sourceStatus = ev.data as SourceStatus
+            const idx = this.messages.findIndex(m => m.id === asstMsg.id)
+            if (idx >= 0) this.messages[idx] = { ...asstMsg }
+          } else if (ev.type === 'verify' && ev.data && typeof ev.data === 'object') {
+            // 联网校验结论（策略 A）。比 source_status 早到 —— 在答案开始流式
+            // 输出之前就发出来了，所以能用来在答案上方提前挂冲突卡片。
+            // 答案正文里的强制警告横幅由后端拼接，前端不重复渲染。
+            asstMsg.verify = ev.data as VerifyEvent
             const idx = this.messages.findIndex(m => m.id === asstMsg.id)
             if (idx >= 0) this.messages[idx] = { ...asstMsg }
           } else if (ev.type === 'ingest' && ev.data) {

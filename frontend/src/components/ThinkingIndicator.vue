@@ -62,6 +62,11 @@ const label = computed<string>(() => {
     if (s.agent === "ingest")  return "入库完成"
     if (s.agent === "report")  return "周报已生成"
   }
+  if (s.stage === "web_verify") {
+    // 策略 A：知识库命中后仍会联网核对。升级到真实浏览器时可能要 5-12s，
+    // 这里带秒数显示（外层模板会拼），用户才知道不是卡死了。
+    return s.status === "done" ? "联网核对完成" : "联网核对中..."
+  }
   if (s.stage === "llm_stream" && s.status === "started") return "生成回答中..."
   return "正在思考..."
 })
