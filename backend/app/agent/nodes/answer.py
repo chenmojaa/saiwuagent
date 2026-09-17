@@ -336,9 +336,18 @@ async def answer_node_stream(state: AgentState, instructions_override=None):
         # ---- 权限门控（默认模式）----
         # mcp_invoke 意味着访问本地能力（文件/命令/网络），默认模式下
         # 先经用户批准：yield permission_request -> 前端弹窗 -> POST 决定。
+        #
+        # 注意 tool 是 LangChain 的 StructuredTool **对象**（_tool_by_name 用
+        # getattr(t, "name") 匹配后返回的对象），不是 dict。mcp_invoke 是通用
+        # 工具，真正的目标 server 在 args["server_id"] 里。早期这里写成
+        # tool.get("server")，导致每次 mcp_invoke 都抛
+        # AttributeError: 'StructuredTool' object has no attribute 'get'。
+        # 取不到 server_id 时 target 为空串，永远不等于已批准集合 —— 即失败时
+        # 倾向再问一次（fail-closed），符合权限门控的预期。
         denied_by_permission = False
+        target = (args.get("server_id") or "") if isinstance(args, dict) else ""
         if (perm_mode != "full" and name == "mcp_invoke" and tool is not None
-                and tool.get("server") not in turn_approved_targets):
+                and target not in turn_approved_targets):
           req_id, _fut = _perm.create_request()
           yield ("permission_request", {
             "request_id": req_id,
@@ -350,9 +359,8 @@ async def answer_node_stream(state: AgentState, instructions_override=None):
           if approved:
             # Per-target broker: record this exact server so
             # subsequent same-server calls in this turn skip the modal.
-            srv = (tool.get('server') or '') if tool else ''
-            if srv:
-                turn_approved_targets.add(srv)
+            if target:
+                turn_approved_targets.add(target)
             # 把本次请求涉及的盘符根加入授权范围（后续同轮调用不再被
             # filesystem server 的 allowed-dirs 拦截）
             args = args if isinstance(args, dict) else {}
