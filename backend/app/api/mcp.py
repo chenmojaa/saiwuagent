@@ -51,6 +51,25 @@ MCP_PRESETS = [
     'requirements': 'Node.js / npx',
   },
   {
+    # 用 API key 接入的模型本身没有联网能力（训练数据有截止时间），
+    # 这个预设把「联网搜索」交给模型自己驱动：模型通过 mcp_invoke 打开真实
+    # 浏览器去搜索引擎，再读页面正文，因此能拿到实时信息。
+    # 与内置的 web_search 兜底的区别：兜底是 research 图里代码自动跑、模型
+    # 全程无感知；这里是模型可主动、多轮调用的工具。
+    # 默认有头模式（能看见浏览器窗口）；想跑无头加 '--headless' 即可。
+    'id': 'playwright',
+    'name': 'Playwright',
+    'name_zh': '浏览器搜索',
+    'description': '让 Agent 打开真实浏览器搜索并阅读网页，适合需要实时信息的场景。首次运行会下载 Chromium。',
+    'emoji': '🔎',
+    'category': '联网工具',
+    'transport': 'stdio',
+    'command': 'npx',
+    'args': ['-y', '@playwright/mcp@latest'],
+    'env': {},
+    'requirements': 'Node.js 18+ / npx / 首次运行需下载 Chromium',
+  },
+  {
     'id': 'memory',
     'name': 'Memory',
     'name_zh': '持久记忆',

@@ -17,6 +17,7 @@ answer_instructions: |
   3. First, extract and organize ALL useful information from the references into a clear, structured answer. Only after giving the full answer, briefly note at the end if certain aspects are not covered.
   4. Keep the answer concise but complete.
   5. NEVER use emoji or kaomoji anywhere in the answer (no 🚀 ✅ 😊 📌 ^_^ and the like). Keep the tone plain and professional: structure comes from Markdown headings, bold, lists and tables, not decorative symbols. Plain notation such as -> or → inside tables, code and diagrams is allowed.
+  6. If a reference is labelled 【网络搜索结果】, that material came from a live web search because the user's own knowledge base had nothing relevant. In that case say so plainly near the top of the answer (e.g. 「知识库中未找到相关内容，以下信息来自网络检索」) and still mark the [n] citations normally. Never present web material as if it came from the user's own knowledge base.
 
   Output format:
   - Use Markdown for structure (bold, lists, headings, code blocks, tables).

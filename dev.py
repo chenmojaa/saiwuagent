@@ -76,10 +76,18 @@ def read_env() -> tuple[str, int]:
 
 
 def detect_package_manager() -> str | None:
-    """优先 pnpm，其次 npm。"""
+    """优先 pnpm，其次 npm。返回可执行文件的**完整路径**。
+
+    Windows 上 pnpm / npm 都是 .CMD 包装脚本，而 CreateProcess 不像 cmd.exe
+    那样自动补 .cmd 扩展名——只传裸名字 "pnpm" 会直接抛
+    FileNotFoundError: [WinError 2]。实测后果：后端已经拉起来了，前端 spawn
+    失败把整个 dev.py 带崩，且此时还没进 try 块，后端子进程成了孤儿。
+    所以这里必须返回 shutil.which() 的完整路径。
+    """
     for pm in ("pnpm", "npm"):
-        if shutil.which(pm):
-            return pm
+        found = shutil.which(pm)
+        if found:
+            return found
     return None
 
 

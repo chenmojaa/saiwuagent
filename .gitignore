@@ -72,3 +72,12 @@ _*.log
 
 # Debug screenshots from manual UI testing
 test-*.png
+
+# Playwright MCP artifacts (page snapshots / console logs).
+# The agent spawns MCP servers with cwd = repo root (filesystem MCP relies on
+# it: its allowed dir is "."), so these land here on every browser run.
+.playwright-mcp/
+
+# Agent working notes (.workbuddy-ai/memory/*.md). Local-only: these are
+# session logs with internal reasoning, not project documentation.
+.workbuddy-ai/

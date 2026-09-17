@@ -93,6 +93,34 @@ class Settings(BaseSettings):
   # 单维度下限（max(向量分, 关键词分)）：至少要有一条路径给出信号。
   retrieval_min_dim_score: float = _hd("RETRIEVAL_MIN_DIM_SCORE", 0.18)
 
+  # ---- 联网搜索兜底 ----
+  # 知识库完全搜不到时，是否允许联网搜索补充材料。
+  # 注意：联网结果只用于当轮回答，**绝不写回知识库**（不回填 notes/向量库）。
+  web_search_enabled: bool = _hd("WEB_SEARCH_ENABLED", True)
+  web_search_max_results: int = _hd("WEB_SEARCH_MAX_RESULTS", 5)
+  # 前 N 条额外抓正文（内容更完整但更慢）；0 = 只用搜索摘要
+  web_search_fetch_top: int = _hd("WEB_SEARCH_FETCH_TOP", 2)
+  # HTML 抓取结果为空或与问题不相关时，是否自动改用真实浏览器（Playwright MCP）重搜。
+  # 背景：httpx 抓 Bing 对无 cookie 客户端会返回泛化结果（实测「腾讯控股 2025 年营收」
+  # 只拿到腾讯视频/腾讯网），而真实浏览器能拿到正确结果。代价是 5-12s。
+  # 没装 Playwright MCP 时这项自动失效，功能退化为旧行为。
+  web_search_browser_fallback: bool = _hd("WEB_SEARCH_BROWSER_FALLBACK", True)
+
+  # ---- 联网校验（策略 A：优先知识库 + 联网做校验）----
+  # 与上面的「兜底」是两回事：兜底只在知识库**完全搜不到**时触发；
+  # 校验是**知识库有结果时也联网**，用来核对时效性与事实冲突。
+  # 代价是每轮多一次联网（Bing 抓取 + 正文抽取，实测 5-15s）和一次裁决调用，
+  # 所以留一个总开关，默认开启。
+  web_verify_enabled: bool = _hd("WEB_VERIFY_ENABLED", True)
+  # always     = 只要本轮有知识库材料就联网核对（严格按策略 A）
+  # stale_only = 仅当知识库片段含时效敏感信号（年份/价格/政策/人事等）才联网
+  web_verify_mode: str = _hd("WEB_VERIFY_MODE", "always")
+  # 裁决用的模型档位：留空 = 复用 router_model（廉价模型，与 follow-up 同档）
+  web_verify_model: str = _hd("WEB_VERIFY_MODEL", "")
+  # 送去裁决的知识库片段 / 联网结果条数上限（控制 prompt 体积）
+  web_verify_max_kb_chunks: int = _hd("WEB_VERIFY_MAX_KB_CHUNKS", 5)
+  web_verify_max_web_results: int = _hd("WEB_VERIFY_MAX_WEB_RESULTS", 5)
+
   # ---- Ingestion ----
   chunk_size: int = 500
   chunk_overlap: int = 80

@@ -306,6 +306,18 @@ class MCPSession:
     self._proc: subprocess.Popen | None = None
     self._next_id = 1  # 0 is reserved by JSON-RPC for request ids we skip
     self._calls = 0
+    # 请求串行化。**这个类不是无状态可并发的**：_request() 是「写请求 ->
+    # 读响应」，两步之间没有原子性保证。两个线程同时用同一个 session，
+    # 响应会串线 —— A 的请求结果被 B 读走，而且**不会报错**，只是静默返回
+    # 另一个调用的结果，比崩溃更难发现。
+    #
+    # 为什么必须在这里加而不是要求调用方加：会话是**池化共享**的
+    # （mcp_tools._sessions / browser_search._session 都是模块级），
+    # 两个并发请求会拿到同一个 session。指望每个调用方都记得加锁不现实。
+    #
+    # 用 RLock 而非 Lock：_ensure_started() 在握手失败时会调 self.close()，
+    # 而它是在持锁状态下被调用的，需要可重入。
+    self._lock = threading.RLock()
 
   # ---- lifecycle ----
   @property
@@ -328,22 +340,29 @@ class MCPSession:
     return True
 
   def close(self) -> None:
-    if self._proc is not None:
-      _kill_tree(self._proc)
-      self._proc = None
+    # 持锁再杀进程：否则可能在另一个线程正读响应时把进程干掉。
+    # 代价是 close() 会等在途请求结束（最多 call_timeout），但这正是我们要的
+    # 语义 —— 宁可晚一点关，也不要让在途调用拿到半个响应。
+    # RLock 可重入，_ensure_started() 在持锁状态下调到这里不会死锁。
+    with self._lock:
+      if self._proc is not None:
+        _kill_tree(self._proc)
+        self._proc = None
 
   # ---- protocol ----
   def _request(self, method: str, params: dict) -> dict | None:
-    if not self._ensure_started():
-      return None
-    self._next_id += 1
-    _write_message(self._proc, {
-      "jsonrpc": "2.0",
-      "id": self._next_id,
-      "method": method,
-      "params": params,
-    })
-    return _read_message(self._proc, self.call_timeout)
+    # 整个「写 + 读」必须原子：否则并发调用会串线（见 __init__ 里 _lock 的说明）。
+    with self._lock:
+      if not self._ensure_started():
+        return None
+      self._next_id += 1
+      _write_message(self._proc, {
+        "jsonrpc": "2.0",
+        "id": self._next_id,
+        "method": method,
+        "params": params,
+      })
+      return _read_message(self._proc, self.call_timeout)
 
   def list_tools(self) -> list[dict]:
     resp = self._request("tools/list", {})

@@ -163,11 +163,16 @@ def execute_plan_node(state: AgentState) -> dict:
 
 
 def replan_node(state: AgentState) -> dict:
-    """Dynamic replanning: one follow-up retrieval round when material is short.
+    """Dynamic replanning: follow-up retrieval rounds when material is short.
 
-    Also serves as the no-plan fallback path (planner disabled / failed):
-    the first round searches the original query directly, subsequent rounds
-    ask the cheap model for the missing angle.
+    三级递进：
+      1) **本地兜底**：还没有任何结果时，先用原始问题搜一次本地
+         （planner 被关掉/失败时的 no-plan fallback 路径）
+      2) **模型生成角度**：有部分结果但不够时，让模型提"还缺什么角度"，继续搜本地
+      3) **联网兜底**：本地彻底搜不到时，联网搜一次
+
+    联网结果只塞进 retrieved_chunks 供本轮作答，**绝不写回知识库**
+    （不碰 notes / chunk_fts / 向量库）。
     """
     query = (state.get("rewritten_query") or state.get("query") or "").strip()
     if not query:
@@ -178,42 +183,72 @@ def replan_node(state: AgentState) -> dict:
     notes = list(state.get("research_notes") or [])
     executed = {str(s.get("query") or "") for s in (state.get("plan_status") or [])}
     executed |= set(notes)
+    web_used = bool(state.get("web_search_used"))
 
     # Pick the next query: original query when we have nothing yet (no-plan
     # fallback path), otherwise a model-generated follow-up angle.
     q = query if not collected else None
-    if q is None:
+    if q is None and collected:
         chat = _followup_model(state)
-        if chat is None:
-            return {"replan_stalled": True,
-                    "step_count": state.get("step_count", 0) + 1}
-        q = _generate_followup(collected, query, chat)
-    if not q or q in executed:
-        # Nothing new to search -> stop the loop (routing checks this flag).
-        _log.info("research: replan stalled (no new query)")
+        if chat is not None:
+            q = _generate_followup(collected, query, chat)
+
+    if q and q not in executed:
+        seen = {_seen_key(c) for c in collected}
+        hits = _search(q, state.get("api_key_override"), state.get("base_url_override"))
+        new_chunks = []
+        for c in hits:
+            if _seen_key(c) in seen:
+                continue
+            seen.add(_seen_key(c))
+            c["matched_query"] = q
+            new_chunks.append(c)
+        collected.extend(new_chunks)
+        notes.append(q)
+
+        _log.info("research: replan q=%r hits=%d total=%d",
+                  q[:60], len(new_chunks), len(collected))
+        return {
+            "retrieved_chunks": collected,
+            "research_notes": notes,
+            "research_iterations": int(state.get("research_iterations") or 0) + 1,
+            "replan_stalled": False,
+            "step_count": state.get("step_count", 0) + 1,
+        }
+
+    # ---- 本地已无新查询可搜：完全无结果时联网兜底（每次对话只试一次）----
+    if not collected and not web_used and settings.web_search_enabled:
+        from app.tools.web_search import web_search
+        _log.info("research: 本地无结果，尝试联网兜底 q=%r", query[:60])
+        try:
+            web_chunks = web_search(
+                query,
+                max_results=int(settings.web_search_max_results),
+                fetch_top=int(settings.web_search_fetch_top),
+            )
+        except Exception as e:      # web_search 自身不抛，这里只是双保险
+            _log.warning("research: web_search 异常: %s", e)
+            web_chunks = []
+
+        if web_chunks:
+            # 只进 retrieved_chunks —— 不回填知识库
+            return {
+                "retrieved_chunks": web_chunks,
+                "research_notes": notes + [query],
+                "web_search_used": True,
+                "research_iterations": int(state.get("research_iterations") or 0) + 1,
+                "replan_stalled": False,
+                "step_count": state.get("step_count", 0) + 1,
+            }
+        _log.info("research: 联网兜底也无结果，结束")
         return {"replan_stalled": True,
+                "web_search_used": True,
                 "step_count": state.get("step_count", 0) + 1}
 
-    seen = {_seen_key(c) for c in collected}
-    hits = _search(q, state.get("api_key_override"), state.get("base_url_override"))
-    new_chunks = []
-    for c in hits:
-        if _seen_key(c) in seen:
-            continue
-        seen.add(_seen_key(c))
-        c["matched_query"] = q
-        new_chunks.append(c)
-    collected.extend(new_chunks)
-    notes.append(q)
-
-    _log.info("research: replan q=%r hits=%d total=%d", q[:60], len(new_chunks), len(collected))
-    return {
-        "retrieved_chunks": collected,
-        "research_notes": notes,
-        "research_iterations": int(state.get("research_iterations") or 0) + 1,
-        "replan_stalled": False,
-        "step_count": state.get("step_count", 0) + 1,
-    }
+    # Nothing new to search -> stop the loop (routing checks this flag).
+    _log.info("research: replan stalled (no new query)")
+    return {"replan_stalled": True,
+            "step_count": state.get("step_count", 0) + 1}
 
 
 

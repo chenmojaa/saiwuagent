@@ -15,11 +15,31 @@ _log = logging.getLogger(__name__)
 # metadata), multicast, reserved, and the well-known AWS / GCP metadata IPs.
 _ALWAYS_BLOCKED_NAMES = {"localhost", "metadata.google.internal"}
 
+# RFC 2544 网络设备基准测试保留段。代理软件（Clash / Surge / sing-box 等）的
+# fake-IP 模式默认就占用 198.18.0.0/16：本机 DNS 会把**所有**域名解析到这一段，
+# 再由代理按域名转发到真实服务器。
+#
+# 问题是 Python 的 ipaddress 把 198.18.0.0/15 归进了 is_private，于是每个公网
+# 域名在这里都会被判成「内网地址」而拒绝。实测表现（2026-09-17）：Bing 搜索页
+# 能抓到（httpx 走系统代理，不过这道校验），但**每一条结果的正文都抓不到**，
+# web_search 只能降级用搜索摘要。
+#
+# 该网段是 IANA 保留段，现实中不会有内网服务监听它，所以按公网放行是安全的；
+# 其余内网段（10/8、172.16/12、192.168/16、127/8）的拦截完全不变。
+_FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"),)
+
+
+def _is_fake_ip(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
+    return any(ip in network for network in _FAKE_IP_NETWORKS)
+
 
 def _ip_to_block(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address", allow_private: bool) -> bool:
     # Always blocked categories — these are SSRF amplifiers regardless of policy.
     if ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
         return True
+    # 代理 fake-IP：不是内网，是代理占位地址，见 _FAKE_IP_NETWORKS 的说明。
+    if _is_fake_ip(ip):
+        return False
     if ip.is_loopback or ip.is_private:
         return not allow_private
     return False
