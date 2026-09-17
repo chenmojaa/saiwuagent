@@ -176,7 +176,32 @@ class TestDeadRuleRemoved(unittest.TestCase):
 
 
 class TestHooksLockUnderConcurrency(unittest.TestCase):
-    """hooks.fire() and hooks.last_runs() must be safe under thread fan-out."""
+    """hooks.fire() and hooks.last_runs() must be safe under thread fan-out.
+
+    注意：hooks.set_hooks() 写的是**真实数据目录**下的 data/hooks/hooks.json
+    （见 hooks.hooks_index_path）。这个类原来直接调 set_hooks(...) 却从不还原，
+    于是「跑一次测试」= 往用户配置里永久写入 8 条指向 /nonexistent/script.py 的
+    PreToolUse 规则。而 hooks.py 对「PreToolUse + 脚本找不到」的判定是
+    decision="block" —— 结果就是**所有 MCP 调用被静默拒绝**，用户看到
+    "[mcp denied by hook] script not found: /nonexistent/script.py"。
+
+    修法：setUp 把 hooks_index_path 重定向到临时目录，测试永不碰真实文件。
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        from app.agent import hooks
+        self._orig_index = hooks.hooks_index_path
+        tmp = Path(tempfile.mkdtemp(prefix="hd_hooks_test_")) / "hooks.json"
+        hooks.hooks_index_path = lambda: tmp
+        hooks.reload()
+
+    def tearDown(self):
+        from app.agent import hooks
+        hooks.hooks_index_path = self._orig_index
+        hooks.reload()
 
     def test_concurrent_fire_does_not_raise(self):
         from app.agent import hooks

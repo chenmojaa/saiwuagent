@@ -12,9 +12,12 @@
 import sys, os, tempfile, asyncio, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# 用临时 DB，避免污染 data/notes.db
+# 用临时 DB，避免污染 data/notes.db。
+# 注意：真正生效的是下面那行直接改 settings.sqlite_path。
+# data_dir/sqlite_path/notes_dir/chroma_dir 是四个独立字段，都默认 ./data，
+# 设 HD_DATA_DIR **无效**（config.py 里没有这个名字）—— 别照抄那种写法，
+# 实测会把测试数据写进开发库（候选库那次污染了 22 条）。
 tmp = tempfile.mkdtemp()
-os.environ["HD_DATA_DIR"] = tmp
 
 from app.storage import db as dbm
 dbm._engine = None  # reset engine if imported elsewhere
