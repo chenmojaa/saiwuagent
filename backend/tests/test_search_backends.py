@@ -478,7 +478,117 @@ def test_mcp_session_serializes_concurrent_requests():
   assert len(set(written)) == 5, "请求 id 必须唯一，否则无法配对响应: %s" % written
 
 
-# ============ 7. 判据模块 ============
+# ============ 7. 无头运行 + 异步渲染 ============
+
+def test_extract_js_uses_textcontent_not_innertext():
+  """回归守卫：抽取必须用 textContent。
+
+  innerText 依赖布局渲染结果，页面还没完成 layout 时返回空串。
+  实测（2026-09-17）headless + 全新配置下 Bing 先走一次 rdr=1 重定向，
+  innerText 抽出来 5 条标题**全是空的** —— 而 li.b_algo 有 10 条、href 正常、
+  页面标题也正确。这是**静默失败**：搜索看起来成功了，实际一条可用内容都没有，
+  最后被相关性闸门判为无关，用户看到的是「未能核对」而不是报错。
+  """
+  from app.tools.browser_search import _EXTRACT_JS
+  assert "textContent" in _EXTRACT_JS, "抽取必须用 textContent"
+  assert "innerText" not in _EXTRACT_JS, \
+    "innerText 依赖布局，页面未渲染完会静默返回空串"
+
+
+def test_with_artifact_dir_appends_once_and_respects_user_choice():
+  """页面快照要写到临时目录，不能往项目里堆。"""
+  from app.tools.browser_search import _with_artifact_dir
+  once = _with_artifact_dir(["-y", "@playwright/mcp@latest", "--headless"])
+  assert "--output-dir" in once, once
+  assert "--headless" in once, "不能丢掉已有参数"
+
+  twice = _with_artifact_dir(once)
+  assert twice.count("--output-dir") == 1, "重复调用不能叠加: %s" % twice
+
+  custom = _with_artifact_dir(["-y", "x", "--output-dir", "D:/custom"])
+  assert custom == ["-y", "x", "--output-dir", "D:/custom"], "用户自己指定了就别覆盖"
+
+
+class _SeqSession:
+  """按调用序列返回预设 evaluate 结果的假会话。"""
+
+  def __init__(self, responses):
+    self.responses = list(responses)
+    self.calls = 0
+    self.navigated = None
+    self.alive = True
+
+  def call(self, name, args):
+    if name == "browser_navigate":
+      self.navigated = args.get("url")
+      return ""
+    self.calls += 1
+    r = self.responses.pop(0) if self.responses else []
+    return "### Result\n" + json.dumps(json.dumps(r, ensure_ascii=False)) + "\n### Ran Playwright code"
+
+  def close(self):
+    pass
+
+
+def _with_fake_session(sess, retry_delay=0.01):
+  """把 browser_search 的会话与重试间隔换成可控的。"""
+  import app.tools.browser_search as B
+  orig_get, orig_delay = B._get_session, B._EXTRACT_RETRY_DELAY
+  B._get_session = lambda: sess
+  B._EXTRACT_RETRY_DELAY = retry_delay
+  return B, orig_get, orig_delay
+
+
+def _restore(B, orig_get, orig_delay):
+  B._get_session, B._EXTRACT_RETRY_DELAY = orig_get, orig_delay
+
+
+def test_retries_when_page_not_rendered_yet():
+  """首次抽到空（页面还在重定向/渲染）-> 重试一次拿到结果。"""
+  row = {"title": "上海落户新政策", "url": "https://a.com/x", "snippet": "上海 2026 年落户政策"}
+  sess = _SeqSession([[], [row]])          # 第一次空，第二次有
+  B, og, od = _with_fake_session(sess)
+  try:
+    out = B.browser_search("上海 2026 年落户政策", max_results=5)
+  finally:
+    _restore(B, og, od)
+  assert out, "重试后应拿到结果"
+  assert out[0]["title"] == "上海落户新政策"
+  assert sess.calls == 2, "应恰好重试一次，实际 %d" % sess.calls
+
+
+def test_gives_up_when_never_rendered():
+  """一直抽到空 -> 用完预算就收手，不能无限循环。"""
+  import time as _t
+  sess = _SeqSession([])                   # 永远空
+  B, og, od = _with_fake_session(sess, retry_delay=0.01)
+  orig_budget = B._EXTRACT_BUDGET_SEC
+  B._EXTRACT_BUDGET_SEC = 0.05             # 预算压到很短，测试才快
+  try:
+    t0 = _t.time()
+    out = B.browser_search("任意查询", max_results=5)
+    elapsed = _t.time() - t0
+  finally:
+    B._EXTRACT_BUDGET_SEC = orig_budget
+    _restore(B, og, od)
+  assert out == [], "抽不到就返回空，由上层判 unverified"
+  assert elapsed < 3, "不能无限重试，实际 %.1fs" % elapsed
+
+
+def test_does_not_retry_when_first_attempt_succeeds():
+  """正常情况只抽一次 —— 不能平白多花时间。"""
+  row = {"title": "T", "url": "https://a.com", "snippet": "S"}
+  sess = _SeqSession([[row]])
+  B, og, od = _with_fake_session(sess)
+  try:
+    out = B.browser_search("查询", max_results=5)
+  finally:
+    _restore(B, og, od)
+  assert out, out
+  assert sess.calls == 1, "首次成功就不该重试，实际调用 %d 次" % sess.calls
+
+
+# ============ 8. 判据模块 ============
 
 def test_search_quality_module_is_shared():
   """判据抽到 search_quality 后，verify 侧仍能用同名入口（兼容既有测试）。"""

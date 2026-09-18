@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import json
 import logging
-import re
+import os
+import tempfile
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -47,7 +49,21 @@ _PLAYWRIGHT_PRESET = "playwright"
 
 _MAX_SNIPPET = 800
 _NAV_TIMEOUT = 45.0
-_CALL_TIMEOUT = 60.0
+# 单次 RPC 超时。navigate 正常 ~2s、evaluate 正常 1-6s，30s 已经很宽松；
+# 调小是为了让卡住的调用快点失败，而不是把用户挂在那里等。
+_CALL_TIMEOUT = 30.0
+
+# 结果页是异步渲染的，browser_navigate 返回时 li.b_algo 未必已经进 DOM。
+# 实测出现过「0 条」：不是解析失败，是真的还没渲染出来（Bing 有时先走一次
+# rdr=1 重定向，navigate 在中间页就返回了）。
+#
+# 但不能无脑重试：evaluate 本身可能是慢的（页面重），重试会把耗时放大成 3 倍 ——
+# 实测有一次单条查询因此花了 57.9s。所以用**时间预算**兜住：
+# 只有在预算还没用完时才重试，慢的情况下干脆放弃，交给上层判 unverified。
+# 注意不能用 browser_wait_for 等选择器 —— 它的参数只有 time / text / textGone，
+# **没有 selector**（传了会被静默忽略，看起来像等待了其实没有）。
+_EXTRACT_BUDGET_SEC = 20.0
+_EXTRACT_RETRY_DELAY = 1.0
 
 # 长连接复用：npx 冷启动 ~4s + 浏览器启动 ~2s，每次搜索都重来太浪费。
 # 一个进程可能服务很多轮对话，所以按进程缓存。
@@ -70,14 +86,21 @@ _call_lock = threading.Lock()
 
 # 提取搜索结果的 JS。用 JSON.stringify 而不是自己拼分隔符 —— MCP 返回的是
 # JSON 字符串，换行/引号会变成字面量转义，手工解析很容易出错（第一版就踩了）。
+#
+# **必须用 textContent，不能用 innerText。** innerText 依赖布局渲染结果，
+# 页面还没完成 layout 时返回空串。实测（2026-09-17）：headless + 全新配置下
+# Bing 会先走一次 rdr=1 重定向，此时 innerText 抽出来 5 条标题**全是空的** ——
+# 而 li.b_algo 有 10 条、链接 href 正常、页面标题也正确。这是静默失败：
+# 搜索看起来成功了，实际一条可用内容都没有，最后被相关性闸门判为无关。
+# textContent 不依赖布局，不受这个时序影响。
 _EXTRACT_JS = """() => JSON.stringify(
   Array.from(document.querySelectorAll('li.b_algo')).slice(0, %d).map(li => {
     const a = li.querySelector('h2 a');
     const p = li.querySelector('p');
     return {
-      title: a ? a.innerText.trim() : '',
+      title: a ? (a.textContent || '').trim() : '',
       url: a ? (a.href || '') : '',
-      snippet: p ? p.innerText.trim() : ''
+      snippet: p ? (p.textContent || '').trim() : ''
     };
   })
 )"""
@@ -129,6 +152,7 @@ def _get_session() -> MCPSession | None:
     except Exception as e:
       _log.warning("browser_search: 服务配置无效: %s", e)
       return None
+    spec.args = _with_artifact_dir(spec.args)
     session = MCPSession(spec, cwd=None, init_timeout=_NAV_TIMEOUT,
                          call_timeout=_CALL_TIMEOUT)
     # 先握一次手，确认真的能用；否则缓存一个坏会话会一直失败。
@@ -138,6 +162,23 @@ def _get_session() -> MCPSession | None:
       return None
     _session = session
     return _session
+
+
+def _with_artifact_dir(args: list[str]) -> list[str]:
+  """把 --output-dir 指到系统临时目录，别往项目里堆页面快照。
+
+  browser_navigate 无法关闭快照（它的入参只有 url），每搜一次都会写一份
+  page-*.yml + console-*.log —— 实测两次运行就 500KB。默认落点是进程 cwd，
+  也就是项目根目录，会持续污染工作区（虽然已 gitignore，但仍是垃圾）。
+  """
+  if any(a == "--output-dir" for a in args):
+    return list(args)          # 用户自己指定了就别覆盖
+  out = os.path.join(tempfile.gettempdir(), "hd-browser-mcp")
+  try:
+    os.makedirs(out, exist_ok=True)
+  except OSError:
+    return list(args)
+  return list(args) + ["--output-dir", out]
 
 
 def close() -> None:
@@ -226,15 +267,24 @@ def browser_search(query: str, max_results: int = 5,
   try:
     with _call_lock:
       session.call("browser_navigate", {"url": url})
-      raw = session.call("browser_evaluate",
-                         {"function": _EXTRACT_JS % max(1, int(max_results))})
+      rows: list[dict] = []
+      deadline = time.monotonic() + _EXTRACT_BUDGET_SEC
+      while True:
+        raw = session.call("browser_evaluate",
+                           {"function": _EXTRACT_JS % max(1, int(max_results))})
+        rows = _parse_evaluate_result(raw, max_results)
+        if rows or time.monotonic() >= deadline:
+          break
+        # 页面还在渲染 / 正在重定向。等一下再抽一次，不要直接判「搜不到」——
+        # 那会白丢一次联网核对机会。但预算用完就收手，别把慢页面拖成几十秒。
+        time.sleep(_EXTRACT_RETRY_DELAY)
   except Exception as e:
     _log.warning("browser_search: 搜索失败 q=%r: %s", q[:60], e)
     return []
 
-  rows = _parse_evaluate_result(raw, max_results)
   if not rows:
-    _log.info("browser_search: 无结果 q=%r", q[:60])
+    _log.info("browser_search: 无结果（已用尽 %.0fs 抽取预算）q=%r",
+              _EXTRACT_BUDGET_SEC, q[:60])
     return []
 
   chunks: list[dict] = []
