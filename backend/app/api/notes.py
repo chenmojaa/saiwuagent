@@ -1,6 +1,7 @@
 """Notes REST API."""
 from __future__ import annotations
 
+import logging
 from typing import Optional
 from fastapi import Query,  APIRouter, HTTPException, UploadFile, File, Header, Response
 from fastapi.responses import FileResponse
@@ -10,9 +11,10 @@ from sqlalchemy import text
 
 from app.storage.db import Note, get_session
 from app.tools.ingest import ingest_url, ingest_text, ingest_pdf, ingest_image, ingest_file, _ingest
-from app.storage.vector import add_chunks, collection_stats, delete_note_chunks
-from app.tools.chunk import chunk_text
-from app.embeddings.factory import embed_texts
+from app.tools.reindex import replace_note_index
+from app.storage.vector import collection_stats, delete_note_chunks
+
+_log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["notes"])
 
@@ -286,15 +288,17 @@ async def api_reembed_note(
   x_embedding_base_url: str | None = Header(None, alias="X-Embedding-Base-URL"),
   x_embedding_model: str | None = Header(None, alias="X-Embedding-Model"),
 ):
-  """Re-run embedding for an existing note."""
+  """Re-run embedding for an existing note（正文不变，只重建索引）。
+
+  重建逻辑统一在 app/tools/reindex.py —— 这里只负责读正文、翻译结果。
+  顺序（先算 embedding -> 先删旧 -> 后写新）的说明见那个模块。
+  """
   import os
   with get_session() as s:
     note = s.get(Note, note_id)
     if not note:
       raise HTTPException(status_code=404, detail="Note not found")
     content_path = note.content_path
-    title = note.title
-    note_id_local = note.id
 
   if not content_path or not os.path.isfile(content_path):
     raise HTTPException(status_code=400, detail="Note content missing on disk")
@@ -302,43 +306,82 @@ async def api_reembed_note(
   with open(content_path, "r", encoding="utf-8", errors="ignore") as f:
     content = f.read()
 
-  # Re-embed ordering: produce the new chunks first, then evict the old ones.
-  # Old code deleted first, which left a note with no retrievable body if
-  # the embed request failed partway through.
-  chunks = chunk_text(content)
-  try:
-    embeddings = embed_texts(
-      chunks,
-      api_key=x_api_key,
-      base_url=_resolve_base_url(None, x_embedding_base_url),
-      model=_resolve_embedding_model(None, x_embedding_model),
+  # write_content=False：正文没变，不必重写文件。
+  res = replace_note_index(
+    note_id, content,
+    api_key=x_api_key,
+    base_url=_resolve_base_url(None, x_embedding_base_url),
+    embedding_model=_resolve_embedding_model(None, x_embedding_model),
+    write_content=False,
+  )
+  if res.note is None:
+    raise HTTPException(status_code=404, detail="Note not found")
+  if res.embedding_failed:
+    # 索引一个字节都没动，笔记保持原样可用 —— 报错让用户修好配置再试。
+    raise HTTPException(status_code=400, detail=res.reason)
+  if not res.embedded and content.strip():
+    raise HTTPException(
+      status_code=400,
+      detail="重建索引失败：向量库写入未成功，笔记当前不可检索，请重试",
     )
-    n = add_chunks(note_id_local, chunks, embeddings)
-    # New vectors are in place; only now do we evict the old ones. The
-    # add_chunks path uses the same note id, so old + new vectors coexist
-    # briefly inside Chroma; we delete by id right after to keep tidy.
-    # If this delete fails, worst case is duplicated retrieval, which is
-    # recoverable by another reembed.
-    delete_note_chunks(note_id_local)
-    with get_session() as s:
-      note = s.get(Note, note_id_local)
-      if note:
-        note.chunk_count = n
-        note.embedded = True
-        if chunks:
-          note.summary = chunks[0][:200]
-        s.add(note)
-        s.commit()
-        s.refresh(note)
-        return _to_dict(note)
-  except Exception as e:
-    with get_session() as s:
-      note = s.get(Note, note_id_local)
-      if note:
-        note.summary = f"[embedding failed] {type(e).__name__}: {e}"
-        s.add(note)
-        s.commit()
-    raise HTTPException(status_code=400, detail=str(e))
+  return _to_dict(res.note)
+
+
+class UpdateContentRequest(BaseModel):
+  content: str = Field(..., description="新的正文（Markdown）")
+  title: Optional[str] = Field(None, description="可选，同时改标题")
+
+
+@router.patch("/notes/{note_id}/content")
+async def api_update_note_content(
+  note_id: str,
+  body: UpdateContentRequest,
+  x_api_key: str | None = Header(None, alias="X-API-Key"),
+  x_embedding_base_url: str | None = Header(None, alias="X-Embedding-Base-URL"),
+  x_embedding_model: str | None = Header(None, alias="X-Embedding-Model"),
+):
+  """改笔记正文并立即重建索引（切分 + 向量 + FTS）。
+
+  这是「知识库内容更新了怎么生效」的入口：改几个字、加几段，调这个接口，
+  新内容马上可检索。
+
+  为什么不用「删掉重建」：那样 note_id 会变，历史回答里的引用（[n] 指向的
+  note_id）就全部失效了。这里保持 id 不变，只换正文与索引。
+
+  失败语义：embedding 失败 -> 400 且**原索引完全不动**（笔记仍可用）；
+  向量写入失败 -> 400 且 embedded=False（前端显示「未索引」，可重试）。
+  两种情况都不会留下「标记已索引但实际搜不到」的孤儿笔记。
+  """
+  import os
+  with get_session() as s:
+    note = s.get(Note, note_id)
+    if not note:
+      raise HTTPException(status_code=404, detail="Note not found")
+    content_path = note.content_path
+
+  # 正文为空也允许（用户可能先清空再写），只是会得到一条无索引的笔记，
+  # embedded=False 会如实反映这一点。
+  res = replace_note_index(
+    note_id,
+    body.content or "",
+    title=body.title,
+    api_key=x_api_key,
+    base_url=_resolve_base_url(None, x_embedding_base_url),
+    embedding_model=_resolve_embedding_model(None, x_embedding_model),
+    write_content=True,
+  )
+  if res.note is None:
+    raise HTTPException(status_code=404, detail="Note not found")
+  if res.embedding_failed:
+    # keep_old_on_embed_failure=False（手动编辑路径）：算 embedding 失败就整体
+    # 放弃 —— 正文和索引都保持旧状态，用户修好配置后可以重试。
+    raise HTTPException(status_code=400, detail=res.reason)
+  if not res.embedded and (body.content or "").strip():
+    raise HTTPException(
+      status_code=400,
+      detail="正文已保存，但索引重建失败（向量库写入未成功），当前不可检索，请重试",
+    )
+  return _to_dict(res.note)
 
 
 @router.delete("/notes/{note_id}")

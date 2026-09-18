@@ -15,18 +15,15 @@ under the SAME note id (preserving identity / RAG references).
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 
 from sqlmodel import Session as SqlSession, select
 
-from app.config import settings
 from app.storage.db import Note, get_engine, update_note_revision
-from app.storage.vector import delete_note_chunks
-from app.tools.chunk import chunk_text
 from app.tools.feishu_client import FeishuClient, FeishuError
 from app.tools.ingest import _ingest
 from app.tools.parse_feishu_doc import parse_feishu_bitable, parse_feishu_docx
+from app.tools.reindex import replace_note_index
 
 _log = logging.getLogger(__name__)
 
@@ -74,93 +71,28 @@ def _drop_and_reingest(existing: Note, new_title: str, new_content: str,
                        api_key, base_url, embedding_model) -> Note:
     """Replace a note's content + chunks while preserving its id.
 
-    Ordering matters: we embed the NEW chunks FIRST. Only if embedding succeeds
-    do we drop the old vectors and add the new ones. If embedding fails (e.g. no
-    API key available to a background run), we keep the OLD vectors intact and do
-    NOT advance the stored revision, so the next sync cycle retries the update
-    instead of leaving the note permanently un-indexed.
+    实际重建走 app/tools/reindex.py 的共用实现 —— 这段逻辑原先在
+    feishu_sync 和 api/notes 各有一份，结果两边写出了不同的顺序
+    （这边对、reembed 那边错，把笔记清成了检索不到的孤儿）。
+    收敛成一份之后就不会再出现这种分歧。
+
+    keep_old_on_embed_failure=True：后台同步没有交互对象，embedding 失败时
+    必须「正文先落地 + 保留旧向量 + 不推进 revision」，下一轮同步再重试；
+    不能像手动重建那样直接报错放弃，否则这条笔记会永远停在未索引状态。
     """
-    note_id = existing.id
-
-    # 1. Re-chunk + embed the new content BEFORE touching the old index.
-    chunks = chunk_text(new_content)
-    embeddings = None
-    if chunks:
-        try:
-            from app.embeddings.factory import embed_texts as _embed
-            embeddings = _embed(chunks, api_key=api_key, base_url=base_url, model=embedding_model)
-        except Exception as e:
-            _log.warning("feishu sync: re-embed failed (keeping old vectors, will retry): %s", e)
-            embeddings = None
-
-    if chunks and embeddings is None:
-        # Embedding failed: refresh on-disk text + title but keep old vectors and
-        # old revision so the next cycle retries.
-        _write_content(existing, new_content)
-        engine = get_engine()
-        with SqlSession(engine) as s:
-            stmt = select(Note).where(Note.id == note_id)
-            n = s.exec(stmt).first()
-            if not n:
-                return existing
-            n.title = new_title[:500]
-            n.word_count = len(new_content)
-            n.source_type = source_type
-            n.embedded = False
-            s.add(n)
-            s.commit()
-            s.refresh(n)
-            return n
-
-    # 2. Embedding succeeded: drop old chunks (Chroma + FTS5) then add new.
-    try:
-        delete_note_chunks(note_id)
-    except Exception as e:
-        _log.warning("feishu sync: delete_note_chunks(%s) failed: %s", note_id, e)
-    _write_content(existing, new_content)
-
-    n_chunks = 0
-    embedded = False
-    if chunks and embeddings:
-        try:
-            from app.storage.vector import add_chunks
-            n_chunks = add_chunks(note_id, chunks, embeddings)
-            embedded = True
-        except Exception as e:
-            _log.warning("feishu sync: add_chunks failed: %s", e)
-
-    # 3. Update Note row + advance revision (only reached when embed succeeded).
-    engine = get_engine()
-    with SqlSession(engine) as s:
-        stmt = select(Note).where(Note.id == note_id)
-        n = s.exec(stmt).first()
-        if not n:
-            return existing  # row vanished; nothing we can do
-        n.title = new_title[:500]
-        n.word_count = len(new_content)
-        n.chunk_count = n_chunks
-        n.embedded = embedded
-        n.source_type = source_type
-        update_note_revision(note_id, revision)
-        s.add(n)
-        s.commit()
-        s.refresh(n)
-        return n
-
-
-def _write_content(existing: Note, new_content: str) -> None:
-    """Overwrite the on-disk markdown for a note (creates the file if lost)."""
-    try:
-        if existing.content_path and os.path.exists(existing.content_path):
-            with open(existing.content_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-        else:
-            new_path = os.path.join(settings.notes_dir, existing.id + ".md")
-            os.makedirs(settings.notes_dir, exist_ok=True)
-            with open(new_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-    except Exception as e:
-        _log.warning("feishu sync: content write failed: %s", e)
+    res = replace_note_index(
+        existing.id,
+        new_content,
+        title=new_title,
+        source_type=source_type,
+        source_revision=revision,
+        api_key=api_key,
+        base_url=base_url,
+        embedding_model=embedding_model,
+        write_content=True,
+        keep_old_on_embed_failure=True,
+    )
+    return res.note if res.note is not None else existing
 
 
 def _sync_docx_node(client: FeishuClient, space_id: str, node: dict,
