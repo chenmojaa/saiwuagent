@@ -14,6 +14,7 @@ from app.embeddings.factory import embed_texts
 from app.tools.fetch_url import fetch_url
 from app.tools.parse_pdf import parse_pdf
 from app.tools.chunk import chunk_text
+from app.tools.reindex import content_hash
 def _resolve_title(parsed_title: str, original_name: str | None, path: str) -> str:
   """Prefer the caller's original filename; fallback to parser's title or path basename.
 
@@ -65,6 +66,8 @@ def _ingest(
     content_path=content_path,
     word_count=len(content),
     created_at=datetime.now(timezone.utc),
+    # 正文指纹：后台扫描靠它发现「data/notes/<id>.md 被直接改过」。
+    content_hash=content_hash(content),
   )
   note = _save_note(note)
 

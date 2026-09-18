@@ -26,6 +26,10 @@ class Note(SQLModel, table=True):
   embedded: bool = False
   source_revision: Optional[str] = None   # remote obj_edit_time / etag for incremental sync
   source_updated_at: Optional[datetime] = None   # when we last saw a remote update
+  # 入库时正文（content_path 那份 .md）的 sha1。用于判断「磁盘上的正文被改过没有」——
+  # 直接编辑 data/notes/<id>.md 之后，后台扫描靠它发现变化并自动重建索引。
+  # 飞书那条走 source_revision，本地文件没有远端版本号，只能靠内容 hash。
+  content_hash: Optional[str] = None
 
 
 class ChatSession(SQLModel, table=True):
@@ -158,6 +162,7 @@ def _migrate_notes(engine):
   statements = [
     "ALTER TABLE notes ADD COLUMN source_revision TEXT",
     "ALTER TABLE notes ADD COLUMN source_updated_at DATETIME",
+    "ALTER TABLE notes ADD COLUMN content_hash TEXT",
   ]
   with engine.begin() as conn:
     for stmt in statements:

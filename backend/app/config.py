@@ -125,6 +125,15 @@ class Settings(BaseSettings):
   chunk_size: int = 500
   chunk_overlap: int = 80
 
+  # ---- 正文变更自动重建（notes_watch）----
+  # 周期性比对 data/notes/<id>.md 的内容指纹，被直接编辑过就自动重建索引
+  # （切分 + 向量 + FTS），note_id 保持不变。
+  # 只有**真的变了**才会调 embedding，没变时只是读一遍文件比指纹，不花钱。
+  # 0 = 关闭（改成手动调 PATCH /notes/{id}/content）。
+  # 注意：首次运行（升级后 content_hash 为空）只回填指纹、不重建，
+  # 所以开启它不会导致整个知识库被重新 embedding 一遍。
+  notes_autoreindex_interval_min: int = _hd("NOTES_AUTOREINDEX_INTERVAL_MIN", 5)
+
 
 @lru_cache
 def get_settings() -> Settings:

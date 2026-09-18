@@ -113,12 +113,41 @@ async def lifespan(app: FastAPI):
   else:
     logger.info("Feishu sync interval=0 (manual sync only)")
 
+  # ---- 正文变更自动重建（notes_watch）----
+  # 直接编辑 data/notes/<id>.md 之后，靠内容指纹发现变化并自动重建索引。
+  # 与飞书循环是两件事：飞书看远端 revision，这里看本地文件内容。
+  _notes_task = None
+  if settings.notes_autoreindex_interval_min > 0:
+    import asyncio
+    from app.notes_watch import scan_once
+    _notes_interval_s = max(60, settings.notes_autoreindex_interval_min * 60)
+
+    async def _notes_loop():
+      logger.info(f"Notes auto-reindex loop started, interval={_notes_interval_s}s")
+      while True:
+        try:
+          stats = await asyncio.to_thread(scan_once)
+          if stats["reindexed"] or stats["failed"]:
+            logger.info(
+              "Notes auto-reindex: checked=%d reindexed=%d backfilled=%d failed=%d",
+              stats["checked"], stats["reindexed"], stats["backfilled"], stats["failed"])
+        except Exception as e:
+          # 后台旁路，坏掉不该影响服务。
+          logger.warning(f"Notes auto-reindex failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(_notes_interval_s)
+
+    _notes_task = asyncio.create_task(_notes_loop())
+  else:
+    logger.info("Notes auto-reindex interval=0 (manual PATCH only)")
+
   logger.info("=" * 50)
   try:
     yield
   finally:
     if _feishu_task is not None and not _feishu_task.done():
       _feishu_task.cancel()
+    if _notes_task is not None and not _notes_task.done():
+      _notes_task.cancel()
 
 
 app = FastAPI(
